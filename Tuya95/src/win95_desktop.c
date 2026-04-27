@@ -722,24 +722,30 @@ STATIC VOID_T __clock_cb(lv_timer_t *timer)
 
 /**
  * @brief Draw the network tray icon (single 12x12 ARGB sprite that already
- *        depicts a pair of connected PCs)
+ *        depicts a pair of connected PCs), upscaled 2x to 24x24 with
+ *        nearest-neighbor for crisp Win95 pixel art.
  * @param[in] parent tray container
- * @param[in] x x position inside the tray
- * @param[in] y y position inside the tray
+ * @param[in] x x position inside the tray (top-left corner of bounding box)
+ * @param[in] y y position inside the tray (top-left corner of bounding box)
  * @return image object
- * @note We force the image bounding box to match the sprite's natural size and
- *       pin alignment to CENTER. This is defensive against any inherited
- *       container style that might enable tiling/stretching and trigger the
- *       "two-icons-in-one" optical illusion seen on the device.
+ * @note We avoid LV_IMAGE_ALIGN_STRETCH because update_align is only fired
+ *       on src / inner_align changes (not on lv_obj_set_size), which can
+ *       lock the scale factor before the final size is known. Instead we
+ *       set scale=2x explicitly and size the obj to match (nat * 2). Anti-
+ *       aliasing is disabled so each source pixel maps to a hard 2x2 block.
  */
 STATIC lv_obj_t *__mini_monitor(lv_obj_t *parent, INT32_T x, INT32_T y)
 {
     lv_obj_t *mon = lv_image_create(parent);
     lv_obj_remove_style_all(mon);
     lv_image_set_src(mon, &g_win95_icon_traynet);
-    lv_image_set_inner_align(mon, LV_IMAGE_ALIGN_CENTER);
-    lv_image_set_scale(mon, LV_SCALE_NONE);
-    lv_obj_set_size(mon, g_win95_icon_traynet.header.w, g_win95_icon_traynet.header.h);
+    lv_image_set_inner_align(mon, LV_IMAGE_ALIGN_TOP_LEFT);
+    lv_image_set_antialias(mon, false);
+    lv_image_set_pivot(mon, 0, 0);
+    lv_image_set_scale(mon, LV_SCALE_NONE * 2);
+    INT32_T sw = (INT32_T)g_win95_icon_traynet.header.w * 2;
+    INT32_T sh = (INT32_T)g_win95_icon_traynet.header.h * 2;
+    lv_obj_set_size(mon, sw, sh);
     lv_obj_set_pos(mon, x, y);
     lv_obj_set_style_bg_opa(mon, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(mon, 0, 0);
@@ -785,18 +791,21 @@ STATIC VOID_T __build_taskbar(VOID_T)
     lv_obj_add_event_cb(s_w95.start_btn, __start_btn_press_cb, LV_EVENT_PRESS_LOST, NULL);
     lv_obj_add_event_cb(s_w95.start_btn, __start_cb, LV_EVENT_CLICKED, NULL);
 
-    /* System tray area (wider to fit net icon + clock) */
+    /* System tray area (sized to fit a 24x24 net icon + clock; tray wraps
+     * the full height of the taskbar's content area, leaving 1px for the
+     * taskbar bevel on top and bottom) */
     lv_obj_t *tray = lv_obj_create(s_w95.taskbar);
     lv_obj_remove_style_all(tray);
-    lv_obj_set_size(tray, 74, WIN95_START_BTN_H);
-    lv_obj_align(tray, LV_ALIGN_RIGHT_MID, -3, 1);
+    lv_obj_set_size(tray, 74, 26);
+    lv_obj_align(tray, LV_ALIGN_RIGHT_MID, -3, 0);
     lv_obj_set_style_bg_color(tray, lv_color_hex(WIN95_COLOR_TASKBAR), 0);
     lv_obj_set_style_bg_opa(tray, LV_OPA_COVER, 0);
     lv_obj_clear_flag(tray, LV_OBJ_FLAG_SCROLLABLE);
     __sunken(tray);
 
-    /* Network indicator (single sprite, image already depicts 2 PCs) */
-    s_w95.net_ico = __mini_monitor(tray, 2, 2);
+    /* Network indicator (24x24 = 2x of the 12x12 sprite, placed in the
+     * tray content area inset by the 1px sunken border) */
+    s_w95.net_ico = __mini_monitor(tray, 1, 0);
     lv_obj_add_flag(s_w95.net_ico, LV_OBJ_FLAG_HIDDEN);
 
     /* Clock label */

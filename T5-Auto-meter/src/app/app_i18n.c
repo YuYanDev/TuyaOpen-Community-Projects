@@ -7,6 +7,7 @@
  */
 #include "app_i18n.h"
 #include "app_kv.h"
+#include "lv_font_zh_16.h"
 #include "tal_api.h"
 
 /* app_kv.c hard-codes the literal `2` as the APP_LANG_COUNT clamp boundary
@@ -183,23 +184,41 @@ const char *app_i18n_get(APP_STR_E id)
 }
 
 /**
- * @brief Pick a default font matching the active language's script.
+ * @brief Pick a default font for menu / overlay rows.
  *
- * For EN we keep Montserrat 16 — same metrics as the menu used
- * before v1.8. For ZH we drop to LVGL's bundled SimSun 16 px CJK so
- * Chinese glyphs render. (LVGL ships exactly one CJK glyph size by
- * default; if higher resolutions are needed they have to be
- * generated with lv_font_conv and added to the build.)
+ * v1.8.1 returns `lv_font_zh_16` for **both** languages, on purpose:
+ *
+ *  - LVGL's bundled `lv_font_simsun_16_cjk` was rejected — its
+ *    `--symbols` list is the chat-bot vocabulary (Japanese-flavoured
+ *    + Traditional + a few Simplified glyphs) and most simplified
+ *    Chinese glyphs we use here fell through to "tofu" rectangles.
+ *  - Returning Montserrat 16 for EN looked fine while running in EN,
+ *    but the MENU_LANG row deliberately shows the OTHER language's
+ *    label (e.g. "语言：中文" while running in EN, so the user can
+ *    see what tapping the row will switch TO). Montserrat has no
+ *    CJK coverage, so this row also rendered as tofu.
+ *
+ *  The project-bundled `lv_font_zh_16` (a NotoSansSC subset, OFL 1.1,
+ *  ~91 KiB flash) covers ASCII 0x20-0x7F plus every CJK glyph
+ *  referenced anywhere in app_i18n.c, so a single font handles both
+ *  Latin and Chinese rows uniformly. NotoSans Latin at 16 px is a
+ *  perfectly readable substitute for Montserrat on the AMOLED panel
+ *  — the only places that intentionally stay on Montserrat are the
+ *  large gauge dial digits / values (montserrat_28/32/48), where
+ *  the heavier Latin metrics matter for legibility from a glance.
+ *
+ *  See `src/ui/fonts/lv_font_zh_16.h` for regeneration instructions
+ *  when a new translated string adds a previously-unused glyph.
  */
 const lv_font_t *app_i18n_font_default(VOID_T)
 {
     if (!s_inited) {
         app_i18n_init();
     }
-#if LV_FONT_SIMSUN_16_CJK
-    if (s_lang == APP_LANG_ZH) {
-        return &lv_font_simsun_16_cjk;
-    }
-#endif
-    return &lv_font_montserrat_16;
+    /* Same font for EN and ZH so the special MENU_LANG row (which
+     * always shows the OTHER language's label) renders correctly
+     * regardless of the active language. NotoSansSC subset covers
+     * both ASCII and the CJK glyphs we use. */
+    (void)s_lang;
+    return &lv_font_zh_16;
 }

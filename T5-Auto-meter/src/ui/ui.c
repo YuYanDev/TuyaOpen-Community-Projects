@@ -53,7 +53,23 @@
 /* ---------------------------------------------------------------------------
  * Macros
  * --------------------------------------------------------------------------- */
-#define UI_REFRESH_PERIOD_MS    100
+/* UI data-refresh period.
+ *
+ * v1.8 used 100 ms (10 Hz). With the tracker at 125 Hz / τ ≈ 65 ms,
+ * the needle reached ≥85% of each new target within one refresh
+ * period — visible as a discrete "lurch" at every tick rather than
+ * smooth motion. The user reported "在两次数据中间需要插值".
+ *
+ * v1.8.2 drops to 33 ms (~30 Hz). The 200 Hz tracker now sees a new
+ * target ~6 times per τ, so the EMA traces a low-pass version of the
+ * input sequence as a continuous curve. The center value text label
+ * also updates at 30 Hz so digit changes feel instant rather than
+ * deliberate.
+ *
+ * Cost: __refresh_timer_cb runs 3× more often. The body is cheap
+ * (one app_metric_snapshot + one set_value), so this stays well under
+ * the LVGL task budget. */
+#define UI_REFRESH_PERIOD_MS    33
 #define UI_NEEDLE_TRACK_MS      180   /**< slew during continuous tracking */
 #define UI_NEEDLE_INTRO_MS      900   /**< slew on first sample after link/mock */
 #define UI_BOOT_SWEEP_MS        APP_BOOT_SWEEP_MS
@@ -347,9 +363,10 @@ STATIC VOID_T __build_overlay(VOID_T)
     s_overlay_label = lv_label_create(s_overlay);
     lv_obj_set_style_text_color(s_overlay_label, UI_COLOR_TEXT, 0);
     /* font_default tracks the active language: Montserrat 16 for EN,
-     * SimSun 16 CJK for ZH. We can't use Montserrat 28 here any more
-     * because LVGL only ships one CJK glyph size and we need a
-     * matching pair so the metrics line up after a lang flip. */
+     * project-bundled NotoSansSC subset (lv_font_zh_16) for ZH. We
+     * keep the same 16-px size for both so the metrics align after a
+     * lang flip — switching between Latin Montserrat and CJK Noto at
+     * different sizes would re-flow the overlay every time. */
     lv_obj_set_style_text_font(s_overlay_label, app_i18n_font_default(), 0);
     lv_label_set_text(s_overlay_label, app_i18n_get(STR_OVL_CONNECTING));
     lv_obj_align(s_overlay_label, LV_ALIGN_CENTER, 0, 30);
@@ -479,10 +496,14 @@ STATIC VOID_T __menu_item_clicked(lv_event_t *e)
         }
     } break;
     case MENU_LANG: {
-        /* Cycle EN <-> ZH and reflow every visible label's font.
-         * Without the font reflow, switching to ZH would render
-         * Chinese codepoints as missing-glyph boxes because the
-         * Montserrat tables don't contain the CJK range. */
+        /* Cycle EN <-> ZH. v1.8.1 uses a single unified font
+         * (lv_font_zh_16, NotoSansSC subset) for both languages
+         * because the MENU_LANG row deliberately shows the OTHER
+         * language's label and we can't dispatch font per-row
+         * cleanly — see app_i18n_font_default() for the rationale.
+         * The font reflow loop below is now a defensive no-op (the
+         * font already covers both scripts) but kept for symmetry
+         * with future per-language-font experiments. */
         APP_LANG_E cur = app_i18n_lang();
         APP_LANG_E nxt = (cur == APP_LANG_EN) ? APP_LANG_ZH : APP_LANG_EN;
         app_i18n_set_lang(nxt);
@@ -579,8 +600,8 @@ STATIC VOID_T __build_menu(VOID_T)
         lv_obj_set_style_text_color(lbl, UI_COLOR_TEXT, 0);
         /* Font is sourced from i18n so a language flip immediately
          * picks up the right glyph table (Montserrat 16 for Latin,
-         * SimSun 16 CJK for Chinese). Same metrics for both, so the
-         * row layout doesn't shift. */
+         * lv_font_zh_16 — NotoSansSC subset — for Chinese). Same
+         * metrics for both, so the row layout doesn't shift. */
         lv_obj_set_style_text_font(lbl, app_i18n_font_default(), 0);
         lv_label_set_text(lbl, "");
         lv_obj_center(lbl);
@@ -601,7 +622,8 @@ STATIC VOID_T __build_menu(VOID_T)
  * Pulls every visible string through app_i18n_get() so a Chinese
  * lang flip via MENU_LANG instantly retranslates the entire menu.
  * The runtime values (ON/OFF, brightness %, …) stay Latin to match
- * the dial labels and avoid the SimSun font having to cover digits.
+ * the dial labels and avoid the CJK font having to cover digits
+ * outside the project-bundled NotoSansSC subset's char list.
  *
  * @return none
  */

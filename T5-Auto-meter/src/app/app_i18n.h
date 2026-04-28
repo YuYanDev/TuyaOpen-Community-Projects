@@ -23,13 +23,18 @@
  * -------------
  *  - English uses LVGL's Montserrat family (we already have 16/22/28
  *    enabled in app_default.config).
- *  - Simplified Chinese uses LVGL's bundled SimSun 16-px CJK font
- *    (CONFIG_LV_FONT_SIMSUN_16_CJK=y, enabled in v1.8).
+ *  - Simplified Chinese uses **the project-bundled `lv_font_zh_16`**
+ *    (NotoSansSC subset under `src/ui/fonts/`, OFL-1.1). LVGL's
+ *    built-in `lv_font_simsun_16_cjk` was tried first but its glyph
+ *    set is the chat-bot vocabulary — most of the menu's simplified
+ *    Chinese characters fell through to "tofu" rectangles. The new
+ *    project-local font's char list is a strict superset of every
+ *    translated string in `app_i18n.c`.
  *
- * Only one CJK glyph size ships with LVGL by default, so when the
- * language is set to Chinese the menu/overlay drop down to that
- * single 16-px size for the duration; the gauge dial labels stay
- * Latin (numbers + units like °C/g/V) and use Montserrat regardless.
+ * Only one CJK glyph size is bundled, so when the language is set to
+ * Chinese the menu / overlay drop down to that single 16-px size for
+ * the duration; the gauge dial labels stay Latin (numbers + units like
+ * °C/g/V) and use Montserrat regardless.
  *
  * Persistence
  * -----------
@@ -159,14 +164,15 @@ OPERATE_RET app_i18n_set_lang(APP_LANG_E lang);
 const char *app_i18n_get(APP_STR_E id);
 
 /**
- * @brief Get the recommended default LVGL font for the active language.
+ * @brief Get the recommended default LVGL font for menu / overlay rows.
  *
- * EN  → &lv_font_montserrat_16
- * ZH  → &lv_font_simsun_16_cjk
- *
- * The menu rows and overlay use this so a language flip immediately
- * picks up CJK glyph coverage. The gauge dial labels are pure Latin
- * (numbers, °C, g, kPa, V) so they stay on Montserrat regardless.
+ * Returns `&lv_font_zh_16` for **both** languages — see the
+ * implementation comment in app_i18n.c for the why (the MENU_LANG
+ * row deliberately shows the OTHER language's label, so a single
+ * unified font that covers both ASCII and CJK is the only safe
+ * choice). The gauge dial digits / value readouts stay on
+ * Montserrat at 28 / 32 / 48 px because the heavier Latin metrics
+ * matter for at-a-glance legibility on a moving vehicle.
  *
  * @return non-NULL font pointer
  */

@@ -56,10 +56,19 @@
  *  the needle from MIN to the live value at the same speed as any
  *  subsequent update.
  *
- * Animation is a persistent tracker timer at 125 Hz (period = 8 ms).
- * Performance: the tracker invalidates only the union(prev, new) AABB
- * around the rotated needle each frame (with a 10 px AA-halo PAD so the
- * round_end half-disc is strictly contained at any rotation).
+ * Animation is a persistent tracker timer at 200 Hz (period = 5 ms),
+ * 2× LVGL's 100 Hz refresh — every refresh consumes the latest two
+ * tracker steps' worth of dirty regions, so visible motion always
+ * tracks at the panel rate even when the data refresh tick (30 Hz)
+ * drops a target update.
+ *
+ * Performance: the tracker invalidates the union of the LAST FOUR
+ * prev_dirty AABBs plus the new one (~30 kpx total per frame, ~5 small
+ * rectangles, with a 16 px AA-halo PAD so the round_end half-disc
+ * stays strictly inside even at peak sweep velocity). Total fill rate
+ * during the boot sweep is well under the SW rasterizer's headroom,
+ * so the visible sweep tracks at the full LVGL refresh rate (no frame
+ * drops, no residual ghost paint).
  *
  * Heap behaviour
  * --------------
@@ -126,28 +135,40 @@ typedef struct {
     int32_t     needle_angle_x10; /**< current needle angle in 0.1° (LVGL trigo) */
     int32_t     needle_target_x10;/**< desired needle angle in 0.1° (set by API) */
 
-    /* Dirty AABB ring buffer covering the LAST TWO frames. v1.8 widens
-     * this from a single AABB to a 2-slot ring because the LVGL stack on
-     * T5AI is configured with CONFIG_ENABLE_LVGL_DUAL_DISP_BUFF=y. With
-     * two framebuffers in use, frame N draws to buffer A, frame N+1 to
-     * buffer B, frame N+2 back to buffer A — so buffer A's frame N+2
-     * dirty must include AABB(N) AS WELL AS AABB(N+1) AND AABB(N+2),
-     * otherwise the OLD needle silhouette in buffer A at AABB(N) is
-     * never repainted and shows up as the "TIP residue at MIN" the user
-     * reported when the boot sweep starts moving away from the dial
-     * minimum.
+    /* Dirty AABB ring buffer covering the LAST FOUR frames. The LVGL
+     * stack on T5AI is configured with CONFIG_ENABLE_LVGL_DUAL_DISP_BUFF=y
+     * (full-screen alternate framebuffers).
      *
-     * The tracker invalidates the UNION of all THREE areas every frame:
-     *   prev_dirty[0]  prev_dirty[1]  new_aabb
-     * and writes new_aabb into the older slot (round-robin via
-     * prev_dirty_idx ^= 1). When motion is slow enough that all three
-     * overlap, this collapses back to the v1.7 behaviour with no extra
-     * cost; when motion is fast enough that AABB(N) and AABB(N+2) don't
-     * overlap (boot sweep), we now correctly invalidate the trail. */
-    lv_area_t   prev_dirty[2];
-    uint8_t     prev_dirty_idx;   /**< 0/1; next slot to overwrite */
+     * v1.8  used a 2-slot ring on the assumption "buffer alternation is
+     *       strict, so 2 prev frames cover both buffers". Reality on
+     *       T5AI: when the OBD task and IMU task both spike (BLE
+     *       characteristic-write storm + IMU sample), LVGL refreshes
+     *       can be skewed enough that the same buffer is rendered
+     *       twice in a row, or the alternation slips. A 2-prev ring
+     *       then leaves frame N-3 stale on the back buffer at frame
+     *       N+1 — visible as the "残留" the user reported.
+     *
+     * v1.8.1 used `lv_obj_invalidate(g->needle)` (full 380×380 obj area)
+     *       per sweep frame to brute-force the issue — guaranteed
+     *       clean, but ~144 kpx of fill per frame stalled the SW
+     *       rasterizer below the LVGL refresh budget so the user
+     *       saw "动画非常卡，帧率需要翻4倍".
+     *
+     * v1.8.2 (current) — 4-slot ring. Each tracker / sweep frame issues
+     *       lv_obj_invalidate_area for prev[0..3] PLUS the new AABB
+     *       (5 small rectangles, ~30 kpx total fill). 4 frames of
+     *       history covers buffer-alternation drift up to 30 ms, which
+     *       comfortably absorbs all the load skew we see in practice.
+     *       Slot rotation is round-robin (prev_dirty_idx mod 4).
+     *
+     * The PAD around each AABB was widened in step (v1.8.2 PAD = 16
+     * vs v1.8 PAD = 10) so the per-frame swept band strictly covers
+     * the next-frame pose's AA halo even at peak sweep velocity
+     * (~7°/frame at the ease-in-out apex). */
+    lv_area_t   prev_dirty[4];
+    uint8_t     prev_dirty_idx;   /**< 0..3; next slot to overwrite */
 
-    lv_timer_t *track_timer;      /**< 125 Hz tracker that glides angle to target */
+    lv_timer_t *track_timer;      /**< 200 Hz tracker that glides angle to target */
     lv_anim_t   anim;             /**< only used for the boot sweep */
     BOOL_T      sweep_running;    /**< pause tracker while the sweep animation runs */
     BOOL_T      needle_visible;   /**< drawer-level paint gate. FALSE between
@@ -200,12 +221,16 @@ OPERATE_RET ui_gauge_set_def(UI_GAUGE_T *g,
 
 /**
  * @brief Update the needle target. The persistent tracker glides toward
- *        it at 125 Hz with a velocity-capped exponential filter, so calling
- *        this every 100 ms (refresh tick) never restarts an animation.
- *        The first call after create()/sweep() does NOT snap — the tracker
- *        glides from the resting MIN angle to the live value at the same
- *        speed as any subsequent update, giving the user the slow "needle
- *        sliding off the minimum" intro they asked for.
+ *        it at 200 Hz with a velocity-capped exponential filter, so
+ *        calling this at the UI refresh tick (33 ms ≈ 30 Hz) updates
+ *        the target ~6 times per τ — the EMA smoothly traces a low-
+ *        pass version of the data sequence between consecutive ticks
+ *        instead of "stepping" each tick (the user's "在两次数据中间需要
+ *        插值" feedback). The first call after create()/sweep() does
+ *        NOT snap — the tracker glides from the resting MIN angle to
+ *        the live value at the same speed as any subsequent update,
+ *        giving the user the slow "needle sliding off the minimum"
+ *        intro they asked for.
  *
  * @param[in,out] g gauge
  * @param[in] value target value (clamped to [val_min, val_max])

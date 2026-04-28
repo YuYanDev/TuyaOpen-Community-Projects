@@ -1,9 +1,59 @@
 /**
  * @file sensor_imu.c
- * @brief IMU sampler task — converts accel readings into G/roll updates.
- * @version 1.0
- * @date 2026-04-27
+ * @brief IMU sampler task — high-pass dynamic acceleration on the QMI8658.
+ * @version 1.1
+ * @date 2026-04-28
  * @copyright Copyright (c) Tuya Inc.
+ *
+ * Why a high-pass instead of a one-shot static-cal subtraction
+ * ------------------------------------------------------------
+ *  v1.0..v1.8 captured the gravity vector once at user-pressed
+ *  "calibrate" time and subtracted that constant offset from every
+ *  later sample. That works ONLY while the device stays in the
+ *  exact same pose as at calibration time — tilt the screen by 10°
+ *  and the gravity vector projects differently across body axes,
+ *  the constant offset no longer cancels gravity, and the residual
+ *  reads as a steady, never-zeroing "G" deflection. The user
+ *  reported exactly this behaviour ("我歪一下屏幕G值就变了，回不去")
+ *  — by the textbook accelerometer-physics definition the metric is
+ *  no longer a G value, it's tilt.
+ *
+ *  v1.1 replaces the one-shot offset with a **continuous slow EMA
+ *  gravity tracker** that reflows alongside the user's pose:
+ *
+ *     fast  lp_xyz = lp + (raw - lp)/16        # τ ≈ 320 ms @ 50 Hz
+ *     slow  grav   = grav + (lp - grav)/1024   # τ ≈ 20.5 s   @ 50 Hz
+ *     dynamic     = lp - grav
+ *
+ *  The "fast / slow EMA difference" is the textbook 1-pole high-
+ *  pass filter — DC content (any sustained acceleration vector,
+ *  i.e. gravity in whatever orientation) flows into `grav` and
+ *  cancels out of `dynamic`. Static device → `dynamic` ≈ 0 in any
+ *  orientation. Pulse-style accelerations (braking 1 s, cornering
+ *  2 s) survive nearly intact (≈ 5–10 % decay over a 2 s sustained
+ *  input at τ=20 s), which matches what a vehicle G-meter wants.
+ *
+ *  τ_slow = 20 s is chosen by:
+ *   - α = 1 / 1024 → cheap shift, no divide.
+ *   - 5 s would eat too much of a sustained brake / accel.
+ *   - 60 s would leave the convergence visibly slow when the user
+ *     re-positions the device (e.g. picks it up after a stop, the
+ *     G readout shows "phantom" residual for ~10 s).
+ *
+ * Bootstrap seed
+ * --------------
+ *  KV `g_offset_mg` is repurposed: instead of "the constant offset
+ *  to subtract" it now stores "the last known gravity vector" so
+ *  on next boot the slow EMA starts already converged. If KV has
+ *  no saved seed, the first sample is snapped into `grav` so the
+ *  first ~20 ms after start aren't reading 1 g of bias before the
+ *  EMA had a chance to converge.
+ *
+ *  The user's "Calibrate G" / "Reset Zero" menu button forces
+ *  `grav := lp` immediately (i.e. seeds the EMA to zero out *now*)
+ *  AND persists the new seed to KV — useful when the user rolls
+ *  to a parking spot and wants the meter to read 0 g without
+ *  waiting for the slow EMA's natural convergence.
  */
 #include "sensor_imu.h"
 #include "qmi8658.h"
@@ -15,10 +65,11 @@
 /* ---------------------------------------------------------------------------
  * Macros
  * --------------------------------------------------------------------------- */
-#define IMU_TASK_STACK     2048
-#define IMU_TASK_PRIO      THREAD_PRIO_3
-#define IMU_PERIOD_MS      20      /* ~50 Hz */
-#define IMU_FILTER_ALPHA   16      /* divisor: smoothing 1/16 step per sample */
+#define IMU_TASK_STACK         2048
+#define IMU_TASK_PRIO          THREAD_PRIO_3
+#define IMU_PERIOD_MS          20    /**< 50 Hz sampling */
+#define IMU_FILTER_ALPHA       16    /**< fast LPF divisor; τ ≈ 320 ms @ 50 Hz */
+#define IMU_GRAV_ALPHA_SHIFT   10    /**< slow EMA shift; α=1/1024, τ ≈ 20 s @ 50 Hz */
 
 /* ---------------------------------------------------------------------------
  * Type definitions
@@ -71,18 +122,26 @@ STATIC volatile int32_t s_last_lp_y = 0;
 STATIC volatile int32_t s_last_lp_z = 1000;
 STATIC volatile BOOL_T  s_have_sample = FALSE;
 
-/* Active calibration offsets — subtracted from each sample before publish.
- * Loaded from KV at IMU start, updated by sensor_imu_calibrate_zero(). */
-STATIC volatile int32_t s_off_x = 0;
-STATIC volatile int32_t s_off_y = 0;
-STATIC volatile int32_t s_off_z = 0;
-STATIC volatile BOOL_T  s_off_valid = FALSE;
+/* The latest slow EMA gravity-tracker triplet. Persisted as the KV
+ * seed at "calibrate" time so the next boot's EMA is already pointed
+ * at the right gravity vector. `s_grav_inited` flips to TRUE the first
+ * time we either seed from KV or snap to the first IMU sample. */
+STATIC volatile int32_t s_grav_x = 0;
+STATIC volatile int32_t s_grav_y = 0;
+STATIC volatile int32_t s_grav_z = 1000;
+STATIC volatile BOOL_T  s_grav_inited = FALSE;
+
+/* Whether the active gravity seed came from a saved KV value (i.e.
+ * the user has at some point pressed "Reset Zero" on this device).
+ * The menu uses this to decide between "(saved)" and "(tap to zero)"
+ * hint text — see sensor_imu_calibration_active(). */
+STATIC volatile BOOL_T  s_grav_seeded_from_kv = FALSE;
 
 /* Cross-task hand-shake flags. Written from any task, processed on the
  * IMU sample loop. Single-writer-per-flag pattern, so a bare volatile is
  * sufficient on Cortex-M's word-aligned 8/32-bit accesses. */
-STATIC volatile BOOL_T s_calibrate_request = FALSE;
-STATIC volatile BOOL_T s_clear_calib_request = FALSE;
+STATIC volatile BOOL_T s_calibrate_request   = FALSE;  /**< snap grav := lp */
+STATIC volatile BOOL_T s_clear_calib_request = FALSE;  /**< drop the KV seed */
 
 /* ---------------------------------------------------------------------------
  * Function implementations
@@ -136,31 +195,40 @@ STATIC int32_t __atan2_deg10(int32_t y, int32_t x)
  *
  * Pipeline per tick:
  *   1) Read raw mg from QMI8658 (~50 Hz).
- *   2) Run a 1/IMU_FILTER_ALPHA exponential low-pass.
- *   3) Cache the filtered triplet in s_last_lp_* for cross-task readers.
+ *   2) Fast LPF: lp += (raw - lp) / 16    — denoises ADC jitter.
+ *   3) Slow EMA: grav += (lp - grav) / 1024 — tracks current gravity
+ *      vector across pose changes (τ ≈ 20 s at 50 Hz).
  *   4) Service hand-shake flags:
- *        - s_calibrate_request   : snapshot lp_* into s_off_* and persist.
- *        - s_clear_calib_request : drop the calibration.
- *   5) Subtract s_off_* (if active) and publish on the metric bus.
+ *        - s_calibrate_request   : snap grav := lp now AND persist.
+ *        - s_clear_calib_request : forget the KV seed; tracker keeps
+ *                                  running off whatever it has.
+ *   5) dyn = lp - grav            — the high-pass output, what we ship.
+ *   6) Project dyn onto vehicle fwd / lat using the user-picked
+ *      mounting-pose preset, then publish.
  *
- * Calibration is intentionally serviced HERE, not in the requester
- * thread, so the calibration capture and the next "applied" sample are
- * sequenced from the same writer — no cross-task race on s_off_*.
+ * Why we update everything HERE rather than in the requester thread:
+ * the IMU task is the SOLE writer to grav_*, so cross-task atomicity
+ * reduces to volatile semantics and `s_calibrate_request` is just a
+ * one-shot "do this on next tick" handoff.
  */
 STATIC VOID_T __imu_task(VOID_T *arg)
 {
     (void)arg;
     PR_NOTICE("IMU sampler started");
 
-    /* Pull any persisted calibration into the active offsets. */
+    /* Seed the slow gravity tracker from KV if the user has previously
+     * hit "Reset Zero" on this device — avoids a full ~τ_slow=20 s
+     * convergence period after every cold boot. If KV has nothing,
+     * we'll snap on the first sample below. */
     const APP_PREFS_T *p = app_kv_prefs();
     if (p && p->g_offset_valid) {
-        s_off_x = (int32_t)p->g_offset_mg[0];
-        s_off_y = (int32_t)p->g_offset_mg[1];
-        s_off_z = (int32_t)p->g_offset_mg[2];
-        s_off_valid = TRUE;
-        PR_NOTICE("IMU loaded zero-cal: x=%d y=%d z=%d",
-                  (int)s_off_x, (int)s_off_y, (int)s_off_z);
+        s_grav_x = (int32_t)p->g_offset_mg[0];
+        s_grav_y = (int32_t)p->g_offset_mg[1];
+        s_grav_z = (int32_t)p->g_offset_mg[2];
+        s_grav_inited        = TRUE;
+        s_grav_seeded_from_kv = TRUE;
+        PR_NOTICE("IMU loaded gravity seed: x=%d y=%d z=%d",
+                  (int)s_grav_x, (int)s_grav_y, (int)s_grav_z);
     }
 
     int32_t lp_x = 0, lp_y = 0, lp_z = 1000;
@@ -176,31 +244,52 @@ STATIC VOID_T __imu_task(VOID_T *arg)
             s_last_lp_z = lp_z;
             s_have_sample = TRUE;
 
-            if (s_calibrate_request) {
-                s_off_x = lp_x;
-                s_off_y = lp_y;
-                s_off_z = lp_z;
-                s_off_valid = TRUE;
-                s_calibrate_request = FALSE;
-                /* Persist on the IMU thread — flash write may take a few ms,
-                 * which is fine: we'll just skip 1-2 sample periods. */
-                app_kv_set_g_offset((int16_t)lp_x, (int16_t)lp_y, (int16_t)lp_z);
-                PR_NOTICE("IMU zero-cal captured: x=%d y=%d z=%d",
-                          (int)lp_x, (int)lp_y, (int)lp_z);
-            }
-            if (s_clear_calib_request) {
-                s_off_x = 0;
-                s_off_y = 0;
-                s_off_z = 0;
-                s_off_valid = FALSE;
-                s_clear_calib_request = FALSE;
-                app_kv_clear_g_offset();
-                PR_NOTICE("IMU zero-cal cleared");
+            /* First-sample bootstrap: if KV had no seed, snap the slow
+             * tracker to the very first lp_* so we don't read 1 g of
+             * apparent gravity for the first ~τ seconds. */
+            if (!s_grav_inited) {
+                s_grav_x = lp_x;
+                s_grav_y = lp_y;
+                s_grav_z = lp_z;
+                s_grav_inited = TRUE;
             }
 
-            int32_t out_x = lp_x - s_off_x;
-            int32_t out_y = lp_y - s_off_y;
-            int32_t out_z = lp_z - s_off_z;
+            if (s_calibrate_request) {
+                /* User pressed "Reset Zero" — force the slow tracker
+                 * to converge instantly and persist as next-boot seed. */
+                s_grav_x = lp_x;
+                s_grav_y = lp_y;
+                s_grav_z = lp_z;
+                s_grav_seeded_from_kv = TRUE;
+                s_calibrate_request   = FALSE;
+                /* Flash write may take a few ms — that's fine, we'll
+                 * just skip 1-2 sample periods. */
+                app_kv_set_g_offset((int16_t)lp_x, (int16_t)lp_y, (int16_t)lp_z);
+                PR_NOTICE("IMU gravity snapped: x=%d y=%d z=%d",
+                          (int)lp_x, (int)lp_y, (int)lp_z);
+            } else {
+                /* Slow tracker on the fast LPF output. With α=1/1024
+                 * at 50 Hz we get τ ≈ 20.5 s — DC content (gravity in
+                 * any orientation) flows in, dynamic accel survives. */
+                s_grav_x += (lp_x - s_grav_x) >> IMU_GRAV_ALPHA_SHIFT;
+                s_grav_y += (lp_y - s_grav_y) >> IMU_GRAV_ALPHA_SHIFT;
+                s_grav_z += (lp_z - s_grav_z) >> IMU_GRAV_ALPHA_SHIFT;
+            }
+
+            if (s_clear_calib_request) {
+                /* User asked to forget the persisted seed. We don't
+                 * touch the running grav_* — the EMA keeps tracking,
+                 * we just clear KV so the next boot starts unseeded. */
+                s_grav_seeded_from_kv = FALSE;
+                s_clear_calib_request = FALSE;
+                app_kv_clear_g_offset();
+                PR_NOTICE("IMU gravity seed cleared");
+            }
+
+            /* High-pass: dynamic acceleration with gravity removed. */
+            int32_t dyn_x = lp_x - s_grav_x;
+            int32_t dyn_y = lp_y - s_grav_y;
+            int32_t dyn_z = lp_z - s_grav_z;
 
             /* Pick up the user-selected mounting orientation each tick.
              * The KV pointer is stable and reads are unsynchronized
@@ -214,11 +303,17 @@ STATIC VOID_T __imu_task(VOID_T *arg)
                 }
             }
             const G_ORIENT_AXES_T *ax = &k_orient_axes[orient];
-            int32_t out_fwd = out_x * ax->fwd[0] + out_y * ax->fwd[1] + out_z * ax->fwd[2];
-            int32_t out_lat = out_x * ax->lat[0] + out_y * ax->lat[1] + out_z * ax->lat[2];
+            int32_t out_fwd = dyn_x * ax->fwd[0] + dyn_y * ax->fwd[1] + dyn_z * ax->fwd[2];
+            int32_t out_lat = dyn_x * ax->lat[0] + dyn_y * ax->lat[1] + dyn_z * ax->lat[2];
 
+            /* Roll attitude is computed from the lp (not dyn) signal:
+             * roll is by definition the orientation of the gravity
+             * vector relative to the device, which is what lp tracks. */
             int32_t roll = __atan2_deg10(lp_y, lp_z);
-            app_metric_set_imu(out_x, out_y, out_z, out_fwd, out_lat, roll);
+            /* Publish the dyn body-frame triplet as g_x/y/z for any
+             * future logging / diagnostics consumer; the UI reads
+             * g_fwd_mg / g_lat_mg. */
+            app_metric_set_imu(dyn_x, dyn_y, dyn_z, out_fwd, out_lat, roll);
         }
         tal_system_sleep(IMU_PERIOD_MS);
     }
@@ -256,11 +351,14 @@ OPERATE_RET sensor_imu_start(VOID_T)
 }
 
 /**
- * @brief Capture & persist current static gravity vector as zero-cal.
+ * @brief Force the slow gravity tracker to snap to the current sample.
  *
- * Posts a request flag that the IMU sample loop services on its next
- * tick — see __imu_task() for the full pipeline. Returns OPRT_COM_ERROR
- * if the IMU has not yet produced a sample (first ~20 ms after start).
+ * Equivalent of "tap to zero now": instead of waiting τ ≈ 20 s for the
+ * slow EMA to converge after a pose change, this seeds it instantly
+ * (grav := lp) and persists the new seed to KV so the next boot
+ * starts already converged. Posts a flag that the IMU sample loop
+ * services on its next tick. Returns OPRT_COM_ERROR if the IMU has
+ * not yet produced a sample (first ~20 ms after start).
  */
 OPERATE_RET sensor_imu_calibrate_zero(VOID_T)
 {
@@ -275,7 +373,12 @@ OPERATE_RET sensor_imu_calibrate_zero(VOID_T)
 }
 
 /**
- * @brief Discard the current zero calibration.
+ * @brief Forget the persisted gravity seed (KV only).
+ *
+ * The running slow EMA keeps tracking — there's nothing meaningful
+ * to "uncalibrate" on a continuous tracker — we just clear the
+ * stored bootstrap seed so the next boot starts from the first
+ * sample. UI surfaces this as the menu's "Forget" affordance.
  */
 OPERATE_RET sensor_imu_clear_calibration(VOID_T)
 {
@@ -287,9 +390,15 @@ OPERATE_RET sensor_imu_clear_calibration(VOID_T)
 }
 
 /**
- * @brief Whether a user-supplied calibration is currently active.
+ * @brief Whether a persisted gravity seed exists in KV.
+ *
+ * The semantics flipped slightly in v1.1 — there is no longer a
+ * "static offset is active" mode, the slow EMA is always live —
+ * but the function still answers the question the menu wants:
+ * "do we have a saved seed (and therefore should we show '(saved)'
+ * vs '(tap to zero)' next to the calibrate row)?".
  */
 BOOL_T sensor_imu_calibration_active(VOID_T)
 {
-    return s_off_valid ? TRUE : FALSE;
+    return s_grav_seeded_from_kv ? TRUE : FALSE;
 }

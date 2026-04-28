@@ -44,11 +44,11 @@ typedef struct {
     int32_t  oil_kpa10;        /**< oil pressure in 0.1 kPa */
     int32_t  voltage_mv;       /**< module voltage in mV */
     int32_t  boost_kpa10;      /**< boost in 0.1 kPa, signed */
-    int32_t  g_x_mg;           /**< raw accel X in IMU body frame (post zero-cal), milli-g */
-    int32_t  g_y_mg;           /**< raw accel Y in IMU body frame (post zero-cal), milli-g */
-    int32_t  g_z_mg;           /**< raw accel Z in IMU body frame (post zero-cal), milli-g */
-    int32_t  g_fwd_mg;         /**< vehicle forward axis acceleration, milli-g (orient-projected) */
-    int32_t  g_lat_mg;         /**< vehicle lateral (right) axis acceleration, milli-g (orient-projected) */
+    int32_t  g_x_mg;           /**< IMU body-frame X DYNAMIC accel (gravity-removed), milli-g */
+    int32_t  g_y_mg;           /**< IMU body-frame Y DYNAMIC accel (gravity-removed), milli-g */
+    int32_t  g_z_mg;           /**< IMU body-frame Z DYNAMIC accel (gravity-removed), milli-g */
+    int32_t  g_fwd_mg;         /**< vehicle forward axis dynamic accel, milli-g (orient-projected) */
+    int32_t  g_lat_mg;         /**< vehicle lateral (right) axis dynamic accel, milli-g (orient-projected) */
     int32_t  roll_deg10;       /**< roll angle in 0.1 ° */
 
     BOOL_T   valid[APP_METRIC_COUNT];
@@ -96,18 +96,20 @@ OPERATE_RET app_metric_set(APP_METRIC_E m, int32_t value);
 /**
  * @brief Update G-force triplet + orient-projected forward/lateral at once (IMU writer).
  *
- * The first three arguments are the raw post-zero-cal IMU body-frame
- * components (kept for diagnostics / future logging). `gfwd_mg` and
- * `glat_mg` are the projection of that vector onto the vehicle's
+ * v1.1 semantic change: the first three arguments are now the
+ * **dynamic** IMU body-frame components (i.e. the high-pass output
+ * `lp - grav` from sensor_imu.c, gravity already removed). They are
+ * kept for diagnostics / future logging. `gfwd_mg` and `glat_mg` are
+ * the projection of the SAME dynamic vector onto the vehicle's
  * forward (positive = nose-forward acceleration / braking-negative)
  * and lateral (positive = right turn) axes — the GoPro reticle and
  * any future longitudinal/lateral display reads these.
  *
- * @param[in] gx_mg     raw IMU X, milli-g
- * @param[in] gy_mg     raw IMU Y, milli-g
- * @param[in] gz_mg     raw IMU Z, milli-g
- * @param[in] gfwd_mg   projected forward axis, milli-g
- * @param[in] glat_mg   projected lateral (right) axis, milli-g
+ * @param[in] gx_mg     dynamic IMU X (gravity-removed), milli-g
+ * @param[in] gy_mg     dynamic IMU Y (gravity-removed), milli-g
+ * @param[in] gz_mg     dynamic IMU Z (gravity-removed), milli-g
+ * @param[in] gfwd_mg   projected forward axis dynamic accel, milli-g
+ * @param[in] glat_mg   projected lateral (right) axis dynamic accel, milli-g
  * @param[in] roll_deg10 roll angle in 0.1 °
  * @return OPRT_OK on success
  */

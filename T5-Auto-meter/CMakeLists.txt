@@ -9,7 +9,7 @@ get_filename_component(APP_NAME ${APP_PATH} NAME)
 
 # Aggregate sources from src/ and known subdirectories
 aux_source_directory(${APP_PATH}/src APP_SRC)
-foreach(dir board sensor obd app ui)
+foreach(dir board sensor obd app ui ui/fonts)
     aux_source_directory(${APP_PATH}/src/${dir} SUB_SRC)
     list(APPEND APP_SRC ${SUB_SRC})
 endforeach()
@@ -22,6 +22,7 @@ set(APP_INC
     ${APP_PATH}/src/obd
     ${APP_PATH}/src/app
     ${APP_PATH}/src/ui
+    ${APP_PATH}/src/ui/fonts
 )
 
 set(APP_OPTIONS "-W")

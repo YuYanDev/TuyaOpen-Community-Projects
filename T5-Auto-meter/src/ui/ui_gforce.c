@@ -64,9 +64,15 @@
 #define GFORCE_CENTRE_R         5               /* fixed red zero marker */
 #define GFORCE_BALL_R           14              /* live ball — 28 px diameter */
 
-#define GFORCE_TRACK_PERIOD_MS  16              /* ~60 Hz */
+/* v1.8.2: tracker upgraded from ~60 Hz to ~100 Hz (matches LVGL's
+ * 10 ms refresh budget). At 50 Hz IMU sample rate × 100 Hz tracker,
+ * each new (gx, gy) target gets ~2 tracker steps, which the EMA
+ * smooths into a continuous trajectory rather than a discrete step
+ * (the user's "在两次数据中间需要插值" feedback). VEL cap reduced
+ * proportionally so peak max angular velocity stays equivalent. */
+#define GFORCE_TRACK_PERIOD_MS  10              /* ~100 Hz */
 #define GFORCE_TRACK_ALPHA       4              /* shift: smoothing 1/16 step */
-#define GFORCE_MAX_VEL_MG       80              /* mg / tick = ~5000 mg/s cap */
+#define GFORCE_MAX_VEL_MG       50              /* mg / tick = ~5000 mg/s cap */
 
 #define GFORCE_BALL_PAD          6              /* AA halo */
 

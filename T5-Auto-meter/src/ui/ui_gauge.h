@@ -1,25 +1,80 @@
 /**
  * @file ui_gauge.h
  * @brief Reusable circular pointer gauge widget for the 466x466 round AMOLED.
- * @version 1.1
+ * @version 1.8
  * @date 2026-04-27
  * @copyright Copyright (c) Tuya Inc.
  *
  * Layout (radius numbers are pixels; centre is the screen centre):
  *   - Outer decorative arc       : r = 220
- *   - Major/minor ticks          : r = 195..215
- *   - Numeric tick labels        : r = 165
+ *   - Major/minor ticks          : r = 198..216 (inner end at 198)
+ *   - Numeric tick labels (32pt) : r = 150  (manually placed lv_label
+ *                                            objects; lv_scale's hardcoded
+ *                                            15 px label-gap forces overlap
+ *                                            with the tick line at large
+ *                                            font sizes, so we draw our own.)
  *   - Needle pivot               : centre (233, 233)
- *   - Needle length              : 175 px
- *   - Hub                        : Ø 36 filled circle (covers needle base)
- *   - Title label                : top of dial
- *   - Big readout (live value)   : centred just below centre
- *   - Unit label                 : below readout
+ *   - Needle silhouette          : SINGLE LINE design (v1.8) — uniform W=14
+ *                                  from BACK behind the pivot to TIP, with
+ *                                  round_end=1 producing a half-disc cap of
+ *                                  radius W/2 = 7 at the tip. ONE primitive,
+ *                                  no cutters, no overlapping triangles.
+ *                                  The user explicitly OK'd dropping the
+ *                                  taper because v1.6/v1.7 multi-primitive
+ *                                  approaches kept producing residual
+ *                                  artefacts (internal black lines or
+ *                                  black-then-red afterimages) — a single
+ *                                  primitive trivially has no interior
+ *                                  boundaries and no AABB-invalidation
+ *                                  edge cases.
+ *   - Hub                        : 6-layer "metallic dome" cap stacked
+ *                                  centre-aligned (radii 30 / 26 / 22 /
+ *                                  18 / 14 / 8). Outermost is the brand
+ *                                  red rim, then a graded grey ramp
+ *                                  (#1A1A1A → #353535 → #505050 → #7A7A7A)
+ *                                  with the inner #7A as a soft specular
+ *                                  highlight, finally the near-black face
+ *                                  #202020 covers the needle's flat back.
+ *   - Title / value / unit       : ALL stacked in the lower hemisphere;
+ *                                  title at montserrat_28 / offset -150,
+ *                                  value at montserrat_48 / offset -83,
+ *                                  unit at montserrat_22 / offset -41.
  *
- * The needle is a custom-drawn tapered teardrop polygon (wide base, narrow
- * rounded tip) anchored exactly at the pivot. Animation is performed on the
- * needle angle (in 0.1°) instead of the value, which avoids per-frame
- * value→angle conversions and gives perfectly linear rotation motion.
+ * Lifecycle of the needle visibility
+ * ----------------------------------
+ *  The needle is drawn by a custom event handler that consults
+ *  g->needle_visible. While that flag is FALSE the handler returns without
+ *  painting, regardless of LVGL's hidden flag, so a render done between
+ *  create() and sweep() cannot silhouette a stale MIN-angle needle on the
+ *  boot screen.
+ *  After ui_gauge_sweep() finishes the needle stays VISIBLE at MIN
+ *  (= 135°, bottom-left) — that's the resting pose. v1.8 also forces a
+ *  full-needle invalidate at sweep END so any partial AABB residual from
+ *  the last sweep frame is cleanly repainted at MIN (this fixes the
+ *  "0刻度残留三角块" bug). The first call to ui_gauge_set_value() simply
+ *  updates needle_target_x10; the persistent tracker timer then GLIDES
+ *  the needle from MIN to the live value at the same speed as any
+ *  subsequent update.
+ *
+ * Animation is a persistent tracker timer at 125 Hz (period = 8 ms).
+ * Performance: the tracker invalidates only the union(prev, new) AABB
+ * around the rotated needle each frame (with a 10 px AA-halo PAD so the
+ * round_end half-disc is strictly contained at any rotation).
+ *
+ * Heap behaviour
+ * --------------
+ *  v1.8 fixes a slow performance degradation under repeated KEY-cycling.
+ *  Earlier versions called __labels_clear / __labels_build inside
+ *  ui_gauge_set_def, which delete-and-recreate up to 12 lv_label objects
+ *  on every gauge swap. LVGL's label create path allocates style transition
+ *  records that the immediate delete cannot fully reclaim back to the heap
+ *  arena (the freed blocks become small free-list entries), so cycling
+ *  N times leaks ~N × (label-overhead) of fragmented heap until the LVGL
+ *  task starts thrashing the allocator and frame rate falls off a cliff.
+ *  v1.8 pre-creates UI_GAUGE_MAX_LABELS labels once in ui_gauge_create()
+ *  (kept hidden) and ui_gauge_set_def() now JUST UPDATES text/position/
+ *  visibility — zero per-cycle alloc, zero per-cycle free, infinite-cycle
+ *  stable.
  */
 #ifndef __UI_GAUGE_H__
 #define __UI_GAUGE_H__
@@ -34,21 +89,77 @@ extern "C" {
 /* ---------------------------------------------------------------------------
  * Type definitions
  * --------------------------------------------------------------------------- */
-typedef struct {
-    lv_obj_t  *root;
-    lv_obj_t  *arc;
-    lv_obj_t  *scale;
-    lv_obj_t  *needle;        /**< custom-drawn tapered needle (transparent obj) */
-    lv_obj_t  *hub;
-    lv_obj_t  *label_title;
-    lv_obj_t  *label_value;
-    lv_obj_t  *label_unit;
+#define UI_GAUGE_MAX_LABELS 12
 
-    int32_t    val_min;
-    int32_t    val_max;
-    int32_t    val_curr;          /**< latest displayed value (raw user units) */
-    int32_t    needle_angle_x10;  /**< current needle angle in 0.1° (LVGL trigo: 0=3 o'clock, +cw) */
-    lv_anim_t  anim;
+typedef struct {
+    lv_obj_t   *root;
+    lv_obj_t   *arc;
+    lv_obj_t   *scale;
+    lv_obj_t   *needle;        /**< transparent overlay; the needle is rendered
+                                    by __needle_draw_event_cb (single line) */
+
+    /* Layered "metallic dome" cap — 6 concentric circles stacked in z-order.
+     * hub_l0 sits above the needle's flat back. The radii decrease from
+     * 30 px (red rim) down to 8 px (near-black eye) so the user sees a
+     * clear screwed-down cap with depth. */
+    lv_obj_t   *hub_l0;        /**< r = 30 — brand red rim */
+    lv_obj_t   *hub_l1;        /**< r = 26 — very dark grey #1A1A1A */
+    lv_obj_t   *hub_l2;        /**< r = 22 — dark grey       #353535 */
+    lv_obj_t   *hub_l3;        /**< r = 18 — mid grey        #505050 */
+    lv_obj_t   *hub_l4;        /**< r = 14 — light specular  #7A7A7A */
+    lv_obj_t   *hub_l5;        /**< r =  8 — near-black eye  #202020 */
+
+    lv_obj_t   *label_title;
+    lv_obj_t   *label_value;
+    lv_obj_t   *label_unit;
+
+    /* Manually placed dial digits — bypass lv_scale's hardcoded 15 px
+     * label-gap so we can keep the digits well clear of the tick marks
+     * even with a 32 pt font. labels[0..label_count-1] are CCW from the
+     * dial minimum to maximum. */
+    lv_obj_t   *labels[UI_GAUGE_MAX_LABELS];
+    uint8_t     label_count;
+
+    int32_t     val_min;
+    int32_t     val_max;
+    int32_t     val_curr;         /**< latest displayed value (raw user units) */
+    int32_t     needle_angle_x10; /**< current needle angle in 0.1° (LVGL trigo) */
+    int32_t     needle_target_x10;/**< desired needle angle in 0.1° (set by API) */
+
+    /* Dirty AABB ring buffer covering the LAST TWO frames. v1.8 widens
+     * this from a single AABB to a 2-slot ring because the LVGL stack on
+     * T5AI is configured with CONFIG_ENABLE_LVGL_DUAL_DISP_BUFF=y. With
+     * two framebuffers in use, frame N draws to buffer A, frame N+1 to
+     * buffer B, frame N+2 back to buffer A — so buffer A's frame N+2
+     * dirty must include AABB(N) AS WELL AS AABB(N+1) AND AABB(N+2),
+     * otherwise the OLD needle silhouette in buffer A at AABB(N) is
+     * never repainted and shows up as the "TIP residue at MIN" the user
+     * reported when the boot sweep starts moving away from the dial
+     * minimum.
+     *
+     * The tracker invalidates the UNION of all THREE areas every frame:
+     *   prev_dirty[0]  prev_dirty[1]  new_aabb
+     * and writes new_aabb into the older slot (round-robin via
+     * prev_dirty_idx ^= 1). When motion is slow enough that all three
+     * overlap, this collapses back to the v1.7 behaviour with no extra
+     * cost; when motion is fast enough that AABB(N) and AABB(N+2) don't
+     * overlap (boot sweep), we now correctly invalidate the trail. */
+    lv_area_t   prev_dirty[2];
+    uint8_t     prev_dirty_idx;   /**< 0/1; next slot to overwrite */
+
+    lv_timer_t *track_timer;      /**< 125 Hz tracker that glides angle to target */
+    lv_anim_t   anim;             /**< only used for the boot sweep */
+    BOOL_T      sweep_running;    /**< pause tracker while the sweep animation runs */
+    BOOL_T      needle_visible;   /**< drawer-level paint gate. FALSE between
+                                       create() and the first ui_gauge_sweep();
+                                       TRUE thereafter. The needle obj's HIDDEN
+                                       flag is too late — by the time we'd
+                                       toggle it the screen may have already
+                                       drawn one frame at MIN. */
+    BOOL_T      data_valid;       /**< set by the first ui_gauge_set_value();
+                                       used by ui_gauge_set_def() to know
+                                       whether to (re)snap the needle when the
+                                       gauge range changes mid-flight. */
 } UI_GAUGE_T;
 
 /* ---------------------------------------------------------------------------
@@ -88,12 +199,19 @@ OPERATE_RET ui_gauge_set_def(UI_GAUGE_T *g,
                              uint8_t tick_major);
 
 /**
- * @brief Animate the needle from its current angle to a new value.
- *        Durations < 500 ms use a linear path (smooth continuous tracking),
- *        durations >= 500 ms use ease-in-out (dramatic intro/handover).
+ * @brief Update the needle target. The persistent tracker glides toward
+ *        it at 125 Hz with a velocity-capped exponential filter, so calling
+ *        this every 100 ms (refresh tick) never restarts an animation.
+ *        The first call after create()/sweep() does NOT snap — the tracker
+ *        glides from the resting MIN angle to the live value at the same
+ *        speed as any subsequent update, giving the user the slow "needle
+ *        sliding off the minimum" intro they asked for.
+ *
  * @param[in,out] g gauge
  * @param[in] value target value (clamped to [val_min, val_max])
- * @param[in] duration_ms animation duration; 0 = snap
+ * @param[in] duration_ms 0 = snap immediately. > 0 is treated as a hint
+ *                        and currently ignored (the tracker dictates the
+ *                        actual slew speed for visual consistency).
  * @return none
  */
 void ui_gauge_set_value(UI_GAUGE_T *g, int32_t value, uint32_t duration_ms);
@@ -115,7 +233,7 @@ void ui_gauge_sweep(UI_GAUGE_T *g, uint32_t duration_ms);
 void ui_gauge_set_value_text(UI_GAUGE_T *g, const char *text);
 
 /**
- * @brief Set the title displayed at the top of the dial.
+ * @brief Set the title displayed below the hub.
  * @param[in,out] g gauge
  * @param[in] title null-terminated string
  * @return none

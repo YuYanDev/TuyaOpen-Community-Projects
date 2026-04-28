@@ -29,6 +29,7 @@
 #include "app_config.h"
 #include "app_metric.h"
 #include "app_kv.h"
+#include "app_i18n.h"
 #include "app_mock.h"
 #include "board_io.h"
 #include "board_pwr.h"
@@ -59,11 +60,18 @@ STATIC VOID_T __on_obd_state(OBD_SES_STATE_E st);
 /**
  * @brief Translate hardware button events to UI commands.
  *
- * KEY short      : next gauge or menu cursor down
- * KEY long 1s    : (reserved)
- * PWR short      : in MENU activate item
- * PWR long 1s    : open / close menu
- * PWR long 3s    : graceful shutdown (handled by board layer)
+ * KEY  short    : switch to the next enabled gauge (live states only)
+ * KEY  others   : ignored
+ * PWR  short    : toggle menu open/closed (any state except BOOT_SWEEP)
+ * PWR  long 1s  : ignored (single-press is the menu trigger)
+ * PWR  long 3s  : graceful shutdown
+ *
+ * Inside the menu, the touchscreen drives item selection — KEY/PWR-short
+ * still toggle/switch as listed above (PWR-short closes the menu).
+ *
+ * @param[in] btn hardware button id
+ * @param[in] evt event kind
+ * @return none
  */
 STATIC VOID_T __on_btn_evt(BOARD_BTN_E btn, BOARD_BTN_EVT_E evt)
 {
@@ -76,8 +84,6 @@ STATIC VOID_T __on_btn_evt(BOARD_BTN_E btn, BOARD_BTN_EVT_E evt)
         }
     } else if (btn == BOARD_BTN_PWR) {
         if (evt == BOARD_BTN_EV_SHORT) {
-            ui_handle_pwr_short();
-        } else if (evt == BOARD_BTN_EV_LONG_1S) {
             ui_toggle_menu();
         } else if (evt == BOARD_BTN_EV_LONG_3S) {
             APP_LOG("user requested shutdown");
@@ -122,9 +128,11 @@ STATIC VOID_T __user_main(VOID_T)
     board_pwr_latch();
     board_io_init();
 
-    /* Persistent prefs / metric bus */
+    /* Persistent prefs / metric bus / i18n (i18n must follow KV so the
+     * persisted lang choice is honoured before any UI label is built). */
     app_kv_init();
     app_metric_init();
+    app_i18n_init();
 
     /* LVGL */
     lv_vendor_init(DISPLAY_NAME);

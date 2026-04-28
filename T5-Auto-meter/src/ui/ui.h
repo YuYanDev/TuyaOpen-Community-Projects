@@ -45,26 +45,22 @@ void ui_on_obd_state(OBD_SES_STATE_E st);
 
 /**
  * @brief Show the next enabled gauge (driven by KEY short press).
+ *        Inert in MENU and BOOT_SWEEP states.
  * @return none
  */
 void ui_show_next_gauge(VOID_T);
 
 /**
- * @brief Open or close the menu (driven by PWR long press / back).
+ * @brief Toggle the menu open/closed (driven by PWR short press).
+ *        Ignored during BOOT_SWEEP so the boot animation can finish.
  * @return none
  */
 void ui_toggle_menu(VOID_T);
 
 /**
- * @brief Activate currently highlighted menu item (driven by PWR short press
- *        when menu is open) or toggle data source (PWR short press in main).
- * @return none
- */
-void ui_handle_pwr_short(VOID_T);
-
-/**
  * @brief Notify UI that mock-mode preference changed; the UI may need to
  *        update state and (re)trigger a smooth needle transition.
+ * @param[in] enabled new mock pref
  * @return none
  */
 void ui_on_mock_changed(BOOL_T enabled);

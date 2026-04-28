@@ -1,29 +1,102 @@
 /**
  * @file ui_gauge.c
- * @brief Reusable round gauge widget with a custom tapered teardrop needle.
- * @version 1.1
+ * @brief Reusable round gauge with a SINGLE-LINE rounded-cap needle,
+ *        layered metallic hub and AABB dirty-area invalidation.
+ * @version 1.8
  * @date 2026-04-27
  * @copyright Copyright (c) Tuya Inc.
  *
- * Design notes
- * ------------
- *  - The needle is rendered by a transparent overlay obj that handles
- *    LV_EVENT_DRAW_MAIN itself and draws two triangles + a circular tip
- *    cap directly onto the layer. This guarantees the needle's pivot is
- *    exactly the obj centre (= dial centre on screen), so there is never
- *    a "phantom origin" away from the centre.
+ * Why a persistent tracker instead of per-call lv_anim
+ * ----------------------------------------------------
+ *  We run a single 125 Hz tracker timer in the LVGL task context. Every
+ *  frame it glides `needle_angle_x10` toward `needle_target_x10` using
+ *  an exponential step capped to a maximum velocity, with a 1-LSB
+ *  minimum so it never stalls in the EMA's quantised tail.
  *
- *  - The animation drives the needle angle (in 0.1°) directly, not the
- *    user-units value. That avoids per-frame value→angle math and gives
- *    perfectly linear rotation, which is what your eyes expect from an
- *    analog gauge.
+ * Needle silhouette — single line (v1.8)
+ * --------------------------------------
+ *  v1.6 used 4 same-colour overlapping primitives (body + tip + 2 fill
+ *  triangles); seams between adjacent same-colour primitives left
+ *  sub-pixel hairlines. v1.7 tried "BODY-PLUS-CUTTERS" (one body line +
+ *  two BG-coloured triangles cutting away the outer wedges into a
+ *  taper); the cutter approach still produced visible AABB residual
+ *  artefacts during slow rotation — BG triangles painted at frame N
+ *  and the body line at frame N-1 had different rotated bboxes, so on
+ *  some sub-pixel transitions the cutter would clear a wedge of pixels
+ *  the body had previously painted, leaving black-triangle-then-red-line
+ *  afterimages.
  *
- *  - For continuous tracking (refresh tick @ 100 ms), `ui_gauge_set_value`
- *    uses a short linear-path animation (<= refresh period * 1.5) and a
- *    1° angular dead-band, so the needle glides without restart-stutter.
+ *  v1.8 follows the user's explicit guidance ("实在难实现就换成一根的吧"
+ *  — "if it's that hard, just use a single line"): a single
+ *  lv_draw_line, W=14, BACK → TIP, round_end=1. ONE primitive. The line
+ *  has only its own outer red→bg AA edges (which the SW rasteriser
+ *  handles cleanly) and a half-disc cap of radius W/2=7 at the tip. With
+ *  one primitive there are zero interior boundaries, zero same-colour
+ *  seams, zero overlapping rotated bboxes — by construction there can
+ *  never be an internal artefact. The 60/40 taper from earlier versions
+ *  is dropped in exchange for guaranteed clean rendering.
  *
- *  - Long durations (boot sweep, first sample after BLE link) get the
- *    classic ease-in-out path for a more "mechanical" feel.
+ * Sweep end — clean reset (v1.8)
+ * ------------------------------
+ *  The boot sweep runs lv_anim from MIN→MAX→MIN over APP_BOOT_SWEEP_MS.
+ *  Each anim frame uses AABB-union invalidation. The user noticed a
+ *  small triangle artefact lingering at the 0-mark right after the
+ *  sweep finished — this is a textbook "last-anim-tick AABB residual":
+ *  the playback's final frame renders at MIN, but the prev_dirty
+ *  rectangle from the playback's penultimate frame may not strictly
+ *  cover the AA halo around the new (slightly different) MIN pose
+ *  rendered by the renderer for the very last anim tick. v1.8 fixes
+ *  this by issuing an explicit lv_obj_invalidate(needle) inside
+ *  __sweep_ready_cb so the WHOLE needle obj is repainted once at the
+ *  end of the sweep, with prev_dirty resynced to the resting MIN AABB.
+ *  After that the per-frame AABB-union scheme resumes — clean MIN pose,
+ *  no leftover triangle residue.
+ *
+ * Heap stability under repeated KEY-cycling (v1.8)
+ * ------------------------------------------------
+ *  v1.5..v1.7 called __labels_clear (delete N lv_label objs) and then
+ *  __labels_build (re-create N lv_label objs) on every gauge swap inside
+ *  ui_gauge_set_def. Each create/delete pair leaves a few small fragmented
+ *  free-list entries in the LVGL/TKL heap — over many KEY presses the
+ *  arena thrashes, allocator latency climbs, and the user sees frame-rate
+ *  collapse. v1.8 restructures the labels to be CREATE-ONCE-IN-PLACE:
+ *
+ *    - ui_gauge_create(): pre-creates UI_GAUGE_MAX_LABELS = 12 labels,
+ *      all hidden by default.
+ *    - ui_gauge_set_def(): __labels_apply() walks the 12 slots, sets
+ *      text+position+visibility on slots 0..tick_major-1, hides
+ *      slots tick_major..11. Zero alloc, zero free, zero per-cycle
+ *      heap traffic.
+ *    - ui_gauge_destroy(): deletes the labels (called once at teardown,
+ *      not per cycle).
+ *
+ *  Net: the user can KEY-cycle indefinitely without performance decay.
+ *
+ * Layered metallic hub
+ * --------------------
+ *  Six concentric circles stacked centre-aligned, each subsequent layer
+ *  smaller than the previous. Outer to inner:
+ *      r = 30  red rim          UI_COLOR_PRIMARY  (#E53935)
+ *      r = 26  very dark grey   #1A1A1A
+ *      r = 22  dark grey        #353535
+ *      r = 18  mid grey         #505050
+ *      r = 14  specular hi-light #7A7A7A
+ *      r =  8  near-black face  #202020 (UI_COLOR_HUB)
+ *
+ * Per-frame redraw — rotated AABB invalidation
+ * --------------------------------------------
+ *  The tracker computes the rotated AABB of the single needle line
+ *  (LEN+W/2 along x, ±W/2 across) plus a 10 px PAD that covers AA halo
+ *  and the round_end half-disc, and invalidates the UNION of the
+ *  previous frame's AABB and the new one. Sweep frames use the same
+ *  AABB-union machinery, plus the v1.8 sweep-end full invalidate.
+ *
+ * Visibility lifecycle
+ * --------------------
+ *  __needle_draw_event_cb returns immediately while g->needle_visible
+ *  is FALSE — guards against a stray invalidate painting a stale MIN
+ *  silhouette before the boot sweep starts. The flag flips to TRUE
+ *  inside ui_gauge_sweep() and stays TRUE thereafter.
  */
 #include "ui_gauge.h"
 #include "ui_theme.h"
@@ -40,37 +113,90 @@
 #define GAUGE_TICK_LEN_MAJOR   18
 #define GAUGE_TICK_LEN_MINOR   8
 
-/* Needle geometry (local frame: +x along needle, +y perpendicular) */
-#define GAUGE_NEEDLE_LEN       175    /**< pivot to tip distance */
-#define GAUGE_NEEDLE_BACK      6      /**< tail length behind pivot (under hub) */
-#define GAUGE_NEEDLE_BASE_W    14     /**< base (near hub) width */
-#define GAUGE_NEEDLE_TIP_W     4      /**< tip width before the round cap */
-#define GAUGE_NEEDLE_CAP_R     3      /**< rounded tip cap radius */
-#define GAUGE_NEEDLE_PAD       12     /**< invalidation safety margin */
+/* Needle geometry — single-line design (v1.8). Local frame: pivot at
+ * origin, +x toward tip.
+ *
+ *       ┌──────── body W=14 ───────┐━━╮
+ *       │                          │ cap r=W/2=7  (round_end=1)
+ *       └────── pivot at 0,0 ──────┘━━╯
+ *      -BACK                      TIP
+ *
+ * - Body / taper / tip : a single lv_draw_line, p1=(-BACK,0), p2=(TIP,0),
+ *           width=W=14, round_start=0, round_end=1. The line is rendered
+ *           as a uniform-W=14 strip with a half-disc of radius W/2=7
+ *           extending past TIP. There is no internal seam, no overlapping
+ *           primitive — by construction. Trades the old 60/40 taper for
+ *           guaranteed seam-free rendering.
+ * - Back  : flat (round_start=0). Tucked under the Ø16 hub face — the
+ *           furthest back corner is at radius √(BACK²+(W/2)²) ≈ 15.65 < 16
+ *           so the flat back disappears inside the hub disc.
+ *
+ * AABB extent: rectangle [-BACK..LEN+W/2] × [-W/2..+W/2], + a uniform
+ * 10 px PAD to absorb the line's AA halo (~1 px) plus the round_end's
+ * sub-pixel rasterisation tail under arbitrary rotation. PAD=10 leaves
+ * comfortable 2-3 px headroom so the per-frame swept band ALWAYS
+ * strictly contains every pixel the SW renderer touched on the previous
+ * frame — eliminates "trailing strip" residue at slow rotation.
+ */
+#define GAUGE_NEEDLE_LEN       180   /**< pivot → tip centre */
+#define GAUGE_NEEDLE_BACK      14    /**< tail behind pivot (under hub) */
+#define GAUGE_NEEDLE_W         14    /**< uniform line width */
+#define GAUGE_NEEDLE_PAD       10    /**< AABB safety margin (px) */
 
-/* Hub diameter chosen large enough to cover the needle base + back tail. */
-#define GAUGE_HUB_R            18
-#define GAUGE_LABEL_PAD        45
-#define GAUGE_ANGLE_RANGE      270    /**< degrees swept by the dial */
-#define GAUGE_ANGLE_ROTATION   135    /**< 0° tick at 7:30 position */
+/* Six-layer metallic hub. Radii decrease ~4 px per ring so each layer
+ * is a clean 4-px-wide annulus visible to the eye. */
+#define GAUGE_HUB_R_RIM        30    /**< Ø60 red rim */
+#define GAUGE_HUB_R_DIM1       26    /**< very dark grey  #1A1A1A */
+#define GAUGE_HUB_R_DIM2       22    /**< dark grey       #353535 */
+#define GAUGE_HUB_R_MID        18    /**< mid grey        #505050 */
+#define GAUGE_HUB_R_HI         14    /**< specular hi-light #7A7A7A */
+#define GAUGE_HUB_R_FACE        8    /**< near-black face #202020 (UI_COLOR_HUB) */
+
+/* Hub palette (kept local to this file — they're a sub-graphic of the
+ * needle module and not reused elsewhere). */
+#define GAUGE_HUB_C_DIM1       lv_color_hex(0x1A1A1A)
+#define GAUGE_HUB_C_DIM2       lv_color_hex(0x353535)
+#define GAUGE_HUB_C_MID        lv_color_hex(0x505050)
+#define GAUGE_HUB_C_HI         lv_color_hex(0x7A7A7A)
+
+/* Manually-placed dial digit radius, measured from the centre of the
+ * panel to the centre of each label rectangle. With the major tick inner
+ * end at radius 198 and the largest expected digit string ("1500") taking
+ * ~60 px wide at 32 pt, the closest the label rectangle's outer edge can
+ * get to the tick line at any orientation is:
+ *     radius 198 − (radius 150 + half_width 30)  =  18 px gap
+ * which is the breathing room the user asked for. */
+#define GAUGE_LBL_RADIUS       150
+#define GAUGE_ANGLE_RANGE      270   /**< degrees swept by the dial */
+#define GAUGE_ANGLE_ROTATION   135   /**< 0° tick at 7:30 position */
 
 /* Angle range in 0.1° (LVGL trig system: 0 = 3 o'clock, +deg = clockwise). */
 #define GAUGE_ANGLE_X10_MIN    (GAUGE_ANGLE_ROTATION * 10)
 #define GAUGE_ANGLE_X10_MAX    ((GAUGE_ANGLE_ROTATION + GAUGE_ANGLE_RANGE) * 10)
 
-/* Tracking thresholds */
-#define GAUGE_DEADBAND_X10     8      /**< skip set_value if |Δangle| < 0.8° */
-#define GAUGE_TRACK_DUR_MS     180    /**< default tracking slew */
-#define GAUGE_EASE_THRESH_MS   500    /**< >= this duration → ease_in_out */
+/* Persistent tracker. Period halved-ish from v1.5 (10 ms → 8 ms = +25 %
+ * tick rate, satisfying the user's "+20 % fps" ask). α and the velocity
+ * cap are also softened so the per-frame motion is gentler — at 125 Hz
+ * the eye sees more frames covering the same angular distance, so we
+ * can afford a slower glide and it still LOOKS smooth. The softer cap
+ * also makes the "first sample slides in from MIN" intro glide feel
+ * deliberate rather than snap-y (problem 3 from the user feedback). */
+#define GAUGE_TRACK_PERIOD_MS  8      /**< 125 Hz tracker (matches display refresh×1.25) */
+#define GAUGE_TRACK_ALPHA_X100 12     /**< 12 % per frame ≈ τ ≈ 65 ms @ 125 Hz */
+#define GAUGE_TRACK_VEL_X10    60     /**< max 6°/frame ≈ 750°/s catch-up */
+#define GAUGE_DEADBAND_X10     2      /**< snap when |err| < 0.2° */
 
-/* Bounding square that always contains the rotated needle (some safety pad). */
-#define GAUGE_NEEDLE_BOX       ((GAUGE_NEEDLE_LEN + GAUGE_NEEDLE_CAP_R + \
-                                 GAUGE_NEEDLE_PAD) * 2)
+/* The needle obj's bounding box: just big enough to contain the rotated
+ * needle at any angle — a square with side = 2*(LEN + small pad). The
+ * AABB invalidation logic does the per-frame fine-grained dirty area. */
+#define GAUGE_NEEDLE_BOX       ((GAUGE_NEEDLE_LEN + GAUGE_NEEDLE_PAD) * 2)
 
 /* ---------------------------------------------------------------------------
  * Forward declarations
  * --------------------------------------------------------------------------- */
-STATIC VOID_T  __anim_angle_cb(VOID_T *obj, int32_t a_x10);
+STATIC VOID_T  __sweep_anim_cb(VOID_T *obj, int32_t a_x10);
+STATIC VOID_T  __sweep_ready_cb(lv_anim_t *a);
+STATIC VOID_T  __track_timer_cb(lv_timer_t *t);
 STATIC VOID_T  __needle_draw_event_cb(lv_event_t *e);
 STATIC int32_t __value_to_angle_x10(const UI_GAUGE_T *g, int32_t value);
 STATIC int32_t __clamp(int32_t v, int32_t lo, int32_t hi);
@@ -115,27 +241,279 @@ STATIC int32_t __value_to_angle_x10(const UI_GAUGE_T *g, int32_t value)
 }
 
 /**
- * @brief LVGL animation step: store new angle and request a redraw.
+ * @brief Compute the axis-aligned bounding box of the needle hairpin at
+ *        a given angle, in screen-absolute pixel coordinates.
+ *
+ * The v1.7 hairpin's local-frame bounding rectangle is
+ *     [-BACK ..  LEN + TIP_W/2]  ×  [-W/2 .. +W/2]
+ * because:
+ *   - body line covers [-BACK..LEN] × [-W/2..+W/2]
+ *   - cutter triangles are nested INSIDE the body line's bbox
+ *   - tip cap (radius TIP_W/2 half-disc) extends to LEN + TIP_W/2 in +x,
+ *     and ±TIP_W/2 in y (already inside ±W/2)
+ * We rotate the rectangle's 4 corners and take their screen-AABB. The
+ * (now 10 px) GAUGE_NEEDLE_PAD margin strictly contains every pixel the
+ * SW renderer can touch including the AA halo of the body line's flat
+ * edges and the cutter triangles' diagonal red→bg transition.
+ *
+ * @param[in] g gauge (needle obj coords are read for the pivot)
+ * @param[in] angle_x10 needle angle in 0.1°
+ * @param[out] out AABB in screen-absolute coords
+ * @return none
+ */
+STATIC VOID_T __needle_compute_aabb(const UI_GAUGE_T *g,
+                                    int32_t angle_x10, lv_area_t *out)
+{
+    lv_area_t coords;
+    lv_obj_get_coords(g->needle, &coords);
+    int32_t cx = (coords.x1 + coords.x2) / 2;
+    int32_t cy = (coords.y1 + coords.y2) / 2;
+
+    int16_t a = (int16_t)(angle_x10 / 10);
+    int32_t s = lv_trigo_sin(a);
+    int32_t c = lv_trigo_sin((int16_t)(a + 90));
+
+    /* Conservative AABB rectangle in the local needle frame: the single
+     * line's bounding box extended by W/2 in +x for the round_end half-
+     * disc cap. y range is ±W/2 because the line is W-wide everywhere. */
+    static const int32_t LX[4] = {
+        -GAUGE_NEEDLE_BACK,                                 -GAUGE_NEEDLE_BACK,
+         GAUGE_NEEDLE_LEN + GAUGE_NEEDLE_W / 2,
+         GAUGE_NEEDLE_LEN + GAUGE_NEEDLE_W / 2,
+    };
+    static const int32_t LY[4] = {
+        -GAUGE_NEEDLE_W / 2,  GAUGE_NEEDLE_W / 2,
+        -GAUGE_NEEDLE_W / 2,  GAUGE_NEEDLE_W / 2,
+    };
+
+    int32_t xmin = INT32_MAX, xmax = INT32_MIN;
+    int32_t ymin = INT32_MAX, ymax = INT32_MIN;
+    int i;
+    for (i = 0; i < 4; i++) {
+        int32_t rx = (LX[i] * c - LY[i] * s) >> 15;
+        int32_t ry = (LX[i] * s + LY[i] * c) >> 15;
+        int32_t x = cx + rx;
+        int32_t y = cy + ry;
+        if (x < xmin) { xmin = x; }
+        if (x > xmax) { xmax = x; }
+        if (y < ymin) { ymin = y; }
+        if (y > ymax) { ymax = y; }
+    }
+
+    out->x1 = xmin - GAUGE_NEEDLE_PAD;
+    out->y1 = ymin - GAUGE_NEEDLE_PAD;
+    out->x2 = xmax + GAUGE_NEEDLE_PAD;
+    out->y2 = ymax + GAUGE_NEEDLE_PAD;
+}
+
+/**
+ * @brief Seed the dirty-area ring buffer with a single AABB. Used at
+ *        sweep start / set_def / sweep end — i.e. whenever the tracker
+ *        is "starting fresh" and there's no real previous-frame trail.
+ *
+ * @param[in,out] g gauge
+ * @param[in] seed AABB to copy into both ring slots
+ * @return none
+ */
+STATIC VOID_T __needle_dirty_ring_seed(UI_GAUGE_T *g, const lv_area_t *seed)
+{
+    g->prev_dirty[0] = *seed;
+    g->prev_dirty[1] = *seed;
+    g->prev_dirty_idx = 0;
+}
+
+/**
+ * @brief Mark the moving needle's previous-prev + previous + current
+ *        AABB dirty so LVGL re-rasterises the full swept band on BOTH
+ *        framebuffers in dual-buffer mode.
+ *
+ * v1.8 widens the previous-AABB tracking from 1 to 2 frames because
+ * CONFIG_ENABLE_LVGL_DUAL_DISP_BUFF=y means buffer A is rendered on
+ * frames 0/2/4/... and buffer B on frames 1/3/5/.... If we only
+ * invalidate AABB(N-1) ∪ AABB(N), buffer B at frame N+1 won't have
+ * AABB(N-1) marked dirty — but buffer B's last touch at AABB(N-1)
+ * was frame N-1, which painted the OLD needle there. Two frames later
+ * buffer B's AABB(N-1) area still holds that old paint, even though
+ * the screen is showing frame N+2 from buffer A. As soon as the swap
+ * back to buffer B happens (frame N+3), the user sees the old needle
+ * silhouette flicker on at AABB(N-1).
+ *
+ * The boot sweep was the most visible offender because at 125 Hz over
+ * a 270° sweep in 1.32 s, the needle moves ~5 px per frame at the tip,
+ * so AABB(N) and AABB(N-2) typically don't overlap — leaving a clear
+ * trail on the alternate buffer. Tracking 2 prev frames closes the gap.
+ *
+ * @param[in,out] g gauge
+ * @return none
+ */
+STATIC VOID_T __needle_invalidate_swept(UI_GAUGE_T *g)
+{
+    lv_area_t new_area;
+    __needle_compute_aabb(g, g->needle_angle_x10, &new_area);
+
+    /* Invalidate BOTH previous-frame AABBs (one per framebuffer) plus
+     * the new AABB. LVGL coalesces overlapping dirty regions internally,
+     * so when motion is slow this collapses to a single rectangle. */
+    lv_obj_invalidate_area(g->root, &g->prev_dirty[0]);
+    lv_obj_invalidate_area(g->root, &g->prev_dirty[1]);
+    lv_obj_invalidate_area(g->root, &new_area);
+
+    /* Ring-buffer write: overwrite the older of the two slots, flip idx. */
+    g->prev_dirty[g->prev_dirty_idx] = new_area;
+    g->prev_dirty_idx ^= 1;
+}
+
+/**
+ * @brief Persistent ~100 Hz tracker that glides the displayed angle toward
+ *        the target with a velocity-capped exponential filter.
+ *
+ * @param[in] t LVGL timer handle (user data = UI_GAUGE_T*)
+ * @return none
+ *
+ * @note Runs in LVGL task context; safe to call invalidate without locks.
+ *       Disabled while the boot sweep animation is active to avoid the
+ *       two writers fighting over needle_angle_x10.
+ */
+STATIC VOID_T __track_timer_cb(lv_timer_t *t)
+{
+    UI_GAUGE_T *g = (UI_GAUGE_T *)lv_timer_get_user_data(t);
+    if (g == NULL || g->needle == NULL || g->sweep_running) {
+        return;
+    }
+
+    int32_t err = g->needle_target_x10 - g->needle_angle_x10;
+    int32_t abs_err = (err < 0) ? -err : err;
+
+    if (abs_err < GAUGE_DEADBAND_X10) {
+        /* Quietly snap to target if we're already inside the dead-band. */
+        if (g->needle_angle_x10 != g->needle_target_x10) {
+            g->needle_angle_x10 = g->needle_target_x10;
+            __needle_invalidate_swept(g);
+        }
+        return;
+    }
+
+    /* Exponential step toward target, then velocity-cap so big jumps
+     * (boot, BLE intro, gauge cycle) sweep at a constant max rate
+     * instead of teleporting. */
+    int32_t step = (err * GAUGE_TRACK_ALPHA_X100) / 100;
+    if (step >  GAUGE_TRACK_VEL_X10) {
+        step =  GAUGE_TRACK_VEL_X10;
+    }
+    if (step < -GAUGE_TRACK_VEL_X10) {
+        step = -GAUGE_TRACK_VEL_X10;
+    }
+    /* Don't stall in the EMA's quantised tail. */
+    if (step == 0 && err != 0) {
+        step = (err > 0) ? 1 : -1;
+    }
+
+    g->needle_angle_x10 += step;
+    __needle_invalidate_swept(g);
+}
+
+/**
+ * @brief LVGL animation step for the boot sweep.
+ *
+ * Writes the current angle directly. The persistent tracker is paused
+ * via g->sweep_running while this is active.
+ *
  * @param[in] obj gauge handle (passed via lv_anim_set_var)
  * @param[in] a_x10 current angle in 0.1°
  * @return none
  */
-STATIC VOID_T __anim_angle_cb(VOID_T *obj, int32_t a_x10)
+STATIC VOID_T __sweep_anim_cb(VOID_T *obj, int32_t a_x10)
 {
     UI_GAUGE_T *g = (UI_GAUGE_T *)obj;
     if (g == NULL || g->needle == NULL) {
         return;
     }
-    g->needle_angle_x10 = a_x10;
-    lv_obj_invalidate(g->needle);
+    g->needle_angle_x10  = a_x10;
+    g->needle_target_x10 = a_x10;   /* keep target = current during sweep */
+    __needle_invalidate_swept(g);
+}
+
+/**
+ * @brief Called once when the boot sweep finishes; re-engages the tracker.
+ *
+ * Note: v1.6 keeps the needle VISIBLE at the dial minimum (135° = SW)
+ * after the sweep completes — that's the resting pose. The first call
+ * to ui_gauge_set_value() then glides the needle from MIN to the live
+ * value (the user explicitly wants to watch this transition; v1.5
+ * snapped here, which they disliked). The needle silhouette is
+ * deliberately visible behind the BLE-wait overlay during this period.
+ *
+ * @param[in] a animation handle
+ * @return none
+ */
+STATIC VOID_T __sweep_ready_cb(lv_anim_t *a)
+{
+    if (a == NULL) {
+        return;
+    }
+    UI_GAUGE_T *g = (UI_GAUGE_T *)lv_anim_get_user_data(a);
+    if (g == NULL) {
+        return;
+    }
+    g->sweep_running = FALSE;
+    g->needle_target_x10 = g->needle_angle_x10;  /* lock target to MIN */
+
+    /* v1.8 — force a CLEAN repaint of the whole needle area when the
+     * sweep completes. The animation's final tick used a per-frame AABB
+     * union, but the playback's rate-of-change is asymmetric near the
+     * endpoint (ease_in_out) and prev_dirty may have been computed at
+     * a slightly different sub-angle than the actual final pose, leaving
+     * a one- or two-pixel triangle of red at the 0-mark. Issuing a full
+     * lv_obj_invalidate(needle) here forces the SW renderer to repaint
+     * the whole 390-px obj area (cheap one-shot) so the resting-MIN pose
+     * is pixel-clean. We then resync prev_dirty so the tracker resumes
+     * with correct accounting. */
+    if (g->needle) {
+        lv_obj_invalidate(g->needle);
+        lv_area_t resting;
+        __needle_compute_aabb(g, g->needle_angle_x10, &resting);
+        __needle_dirty_ring_seed(g, &resting);
+    }
+}
+
+/**
+ * @brief Rotate a local-frame point (lx, ly) into screen-absolute (sx, sy).
+ *
+ * @param[in] cx pivot screen X
+ * @param[in] cy pivot screen Y
+ * @param[in] s sin(angle) * LV_TRIGO_SIN_MAX
+ * @param[in] c cos(angle) * LV_TRIGO_SIN_MAX
+ * @param[in] lx local X (along needle, +x = toward tip)
+ * @param[in] ly local Y (perpendicular to needle, +y = right of needle)
+ * @param[out] sx output screen X
+ * @param[out] sy output screen Y
+ * @return none
+ */
+STATIC inline VOID_T __rotate_local(int32_t cx, int32_t cy,
+                                    int32_t s, int32_t c,
+                                    int32_t lx, int32_t ly,
+                                    int32_t *sx, int32_t *sy)
+{
+    *sx = cx + ((lx * c - ly * s) >> 15);
+    *sy = cy + ((lx * s + ly * c) >> 15);
 }
 
 /**
  * @brief LV_EVENT_DRAW_MAIN handler for the needle overlay.
  *
- * Draws a tapered (wide base → narrow tip) teardrop using two triangles
- * plus a small circular cap at the tip for an anti-aliased rounded look.
- * The pivot is exactly the obj centre, which sits over the dial centre.
+ * v1.8: SINGLE LINE primitive — the entire needle is one lv_draw_line
+ * with width=GAUGE_NEEDLE_W=14, round_start=0 (flat back tucked under
+ * the hub) and round_end=1 (half-disc cap of radius W/2 at the tip).
+ *
+ * Rationale: with one primitive there are zero same-colour interior
+ * boundaries, zero overlapping rotated sub-bboxes and zero AABB
+ * residuals during slow rotation. The taper from earlier multi-
+ * primitive designs is dropped on the user's explicit guidance —
+ * "实在难实现就换成一根的吧".
+ *
+ * Visibility guard: returns immediately if g->needle_visible is FALSE
+ * (between create() and the first ui_gauge_sweep()), so a stray invalidate
+ * cannot paint a stale MIN-angle silhouette on the boot screen.
  *
  * @param[in] e LVGL event
  * @return none
@@ -150,7 +528,7 @@ STATIC VOID_T __needle_draw_event_cb(lv_event_t *e)
         return;
     }
     UI_GAUGE_T *g = (UI_GAUGE_T *)lv_obj_get_user_data(obj);
-    if (g == NULL) {
+    if (g == NULL || !g->needle_visible) {
         return;
     }
     lv_layer_t *layer = lv_event_get_layer(e);
@@ -158,71 +536,35 @@ STATIC VOID_T __needle_draw_event_cb(lv_event_t *e)
         return;
     }
 
-    /* Pivot = obj geometric centre (in screen-absolute coords) */
     lv_area_t coords;
     lv_obj_get_coords(obj, &coords);
     int32_t cx = (coords.x1 + coords.x2) / 2;
     int32_t cy = (coords.y1 + coords.y2) / 2;
 
-    /* Q15 sin/cos. lv_trigo_sin returns sin(angle) * LV_TRIGO_SIN_MAX(=32768) */
+    /* Q15 sin/cos. lv_trigo_sin returns sin(angle) * LV_TRIGO_SIN_MAX. */
     int16_t a_deg = (int16_t)(g->needle_angle_x10 / 10);
     int32_t s = lv_trigo_sin(a_deg);
     int32_t c = lv_trigo_sin((int16_t)(a_deg + 90));
 
-    /* Trapezoid corners in needle-local frame:
-     *   p0 (back-bottom) ──────────── p3 (tip-top)
-     *   p1 (back-top)    ──────────── p2 (tip-bottom)
-     * The back tail (-BACK..0) is hidden under the hub circle.
-     */
-    static const int32_t LX[4] = {
-        -GAUGE_NEEDLE_BACK,
-        -GAUGE_NEEDLE_BACK,
-         GAUGE_NEEDLE_LEN,
-         GAUGE_NEEDLE_LEN,
-    };
-    static const int32_t LY[4] = {
-        -GAUGE_NEEDLE_BASE_W / 2,
-         GAUGE_NEEDLE_BASE_W / 2,
-         GAUGE_NEEDLE_TIP_W  / 2,
-        -GAUGE_NEEDLE_TIP_W  / 2,
-    };
+    const int32_t BACK_X = -GAUGE_NEEDLE_BACK;
+    const int32_t TIP_X  =  GAUGE_NEEDLE_LEN;
 
-    lv_point_precise_t pts[4];
-    int i;
-    for (i = 0; i < 4; i++) {
-        int32_t rx = (LX[i] * c - LY[i] * s) >> 15;
-        int32_t ry = (LX[i] * s + LY[i] * c) >> 15;
-        pts[i].x = (lv_value_precise_t)(cx + rx);
-        pts[i].y = (lv_value_precise_t)(cy + ry);
-    }
+    int32_t p1x, p1y, p2x, p2y;
+    __rotate_local(cx, cy, s, c, BACK_X, 0, &p1x, &p1y);
+    __rotate_local(cx, cy, s, c, TIP_X,  0, &p2x, &p2y);
 
-    /* Two triangles share the diagonal p0→p2 to avoid a 1-pixel gap. */
-    lv_draw_triangle_dsc_t tri;
-    lv_draw_triangle_dsc_init(&tri);
-    tri.bg_color = UI_COLOR_PRIMARY;
-    tri.bg_opa   = LV_OPA_COVER;
-
-    tri.p[0] = pts[0]; tri.p[1] = pts[1]; tri.p[2] = pts[2];
-    lv_draw_triangle(layer, &tri);
-
-    tri.p[0] = pts[0]; tri.p[1] = pts[2]; tri.p[2] = pts[3];
-    lv_draw_triangle(layer, &tri);
-
-    /* Rounded tip cap: a small filled circle straddling the tip edge. */
-    int32_t tip_x = cx + ((GAUGE_NEEDLE_LEN * c) >> 15);
-    int32_t tip_y = cy + ((GAUGE_NEEDLE_LEN * s) >> 15);
-    lv_draw_rect_dsc_t cap;
-    lv_draw_rect_dsc_init(&cap);
-    cap.bg_color = UI_COLOR_PRIMARY;
-    cap.bg_opa   = LV_OPA_COVER;
-    cap.radius   = LV_RADIUS_CIRCLE;
-    lv_area_t cap_a = {
-        .x1 = tip_x - GAUGE_NEEDLE_CAP_R,
-        .y1 = tip_y - GAUGE_NEEDLE_CAP_R,
-        .x2 = tip_x + GAUGE_NEEDLE_CAP_R,
-        .y2 = tip_y + GAUGE_NEEDLE_CAP_R,
-    };
-    lv_draw_rect(layer, &cap, &cap_a);
+    lv_draw_line_dsc_t l;
+    lv_draw_line_dsc_init(&l);
+    l.color       = UI_COLOR_PRIMARY;
+    l.opa         = LV_OPA_COVER;
+    l.width       = GAUGE_NEEDLE_W;
+    l.round_start = 0;     /* flat back is hidden under the hub face */
+    l.round_end   = 1;     /* half-disc nose cap, radius=W/2=7 */
+    l.p1.x = (lv_value_precise_t)p1x;
+    l.p1.y = (lv_value_precise_t)p1y;
+    l.p2.x = (lv_value_precise_t)p2x;
+    l.p2.y = (lv_value_precise_t)p2y;
+    lv_draw_line(layer, &l);
 }
 
 /**
@@ -238,6 +580,88 @@ STATIC VOID_T __scale_apply_ticks(lv_obj_t *scale, uint8_t tick_major)
     int32_t total_ticks = (majors - 1) * minors_per_major + 1;
     lv_scale_set_total_tick_count(scale, total_ticks);
     lv_scale_set_major_tick_every(scale, minors_per_major);
+}
+
+/**
+ * @brief Pre-create UI_GAUGE_MAX_LABELS dial digit labels (all hidden).
+ *
+ * v1.8 change: labels are no longer destroyed and recreated when the
+ * gauge range/tick count changes (KEY-cycling). Instead we create the
+ * MAX number of slots once at create time and __labels_apply() below
+ * just rewrites text + position + visibility on subsequent set_def
+ * calls. This eliminates a slow per-cycle alloc/free cycle in the LVGL
+ * heap (each lv_label_create touches several small allocations whose
+ * fragments add up over hundreds of KEY presses, eventually causing
+ * frame-rate collapse — exactly the "memory leak" the user reported).
+ *
+ * @param[in,out] g gauge
+ * @return none
+ */
+STATIC VOID_T __labels_create_all(UI_GAUGE_T *g)
+{
+    int i;
+    for (i = 0; i < UI_GAUGE_MAX_LABELS; i++) {
+        lv_obj_t *lbl = lv_label_create(g->root);
+        lv_label_set_text(lbl, "");
+        lv_obj_set_style_text_color(lbl, UI_COLOR_TEXT, 0);
+        lv_obj_set_style_text_font(lbl, &lv_font_montserrat_32, 0);
+        lv_obj_add_flag(lbl, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_clear_flag(lbl, LV_OBJ_FLAG_CLICKABLE);
+        g->labels[i] = lbl;
+    }
+    g->label_count = 0;
+}
+
+/**
+ * @brief Update the pre-created labels for a new (range, tick_major)
+ *        configuration. Zero alloc, zero free.
+ *
+ * Slots [0..tick_major-1] get the right value text, polar-coordinates
+ * position on GAUGE_LBL_RADIUS, and are made visible. Slots
+ * [tick_major..MAX-1] are hidden. Replaces the legacy delete-and-
+ * recreate __labels_build path.
+ *
+ * @param[in,out] g gauge
+ * @param[in] val_min lower bound of the dial range
+ * @param[in] val_max upper bound of the dial range
+ * @param[in] tick_major number of major ticks (clamped to [2 .. MAX])
+ * @return none
+ */
+STATIC VOID_T __labels_apply(UI_GAUGE_T *g, int32_t val_min, int32_t val_max,
+                             uint8_t tick_major)
+{
+    int32_t majors = (tick_major < 2) ? 2 :
+                     (tick_major > UI_GAUGE_MAX_LABELS) ? UI_GAUGE_MAX_LABELS :
+                     tick_major;
+    g->label_count = (uint8_t)majors;
+
+    int32_t span_x10 = GAUGE_ANGLE_X10_MAX - GAUGE_ANGLE_X10_MIN;
+    int32_t i;
+    for (i = 0; i < UI_GAUGE_MAX_LABELS; i++) {
+        if (g->labels[i] == NULL) {
+            continue;
+        }
+        if (i >= majors) {
+            lv_obj_add_flag(g->labels[i], LV_OBJ_FLAG_HIDDEN);
+            continue;
+        }
+        int32_t a_x10 = GAUGE_ANGLE_X10_MIN +
+                        (int32_t)(((int64_t)i * span_x10) / (majors - 1));
+        int16_t a_deg = (int16_t)(a_x10 / 10);
+        int32_t s = lv_trigo_sin(a_deg);
+        int32_t c = lv_trigo_sin((int16_t)(a_deg + 90));
+        int32_t lx = (GAUGE_LBL_RADIUS * c) >> 15;
+        int32_t ly = (GAUGE_LBL_RADIUS * s) >> 15;
+
+        int32_t v = val_min +
+                    (int32_t)(((int64_t)i * (val_max - val_min)) / (majors - 1));
+
+        char buf[12];
+        lv_snprintf(buf, sizeof(buf), "%" LV_PRId32, v);
+        lv_label_set_text(g->labels[i], buf);
+        lv_obj_align(g->labels[i], LV_ALIGN_CENTER, lx, ly);
+        lv_obj_clear_flag(g->labels[i], LV_OBJ_FLAG_HIDDEN);
+    }
 }
 
 /* ---------------------------------------------------------------------------
@@ -266,7 +690,11 @@ OPERATE_RET ui_gauge_create(UI_GAUGE_T *g, lv_obj_t *parent,
     g->val_min = val_min;
     g->val_max = val_max;
     g->val_curr = val_min;
-    g->needle_angle_x10 = GAUGE_ANGLE_X10_MIN;
+    g->needle_angle_x10  = GAUGE_ANGLE_X10_MIN;
+    g->needle_target_x10 = GAUGE_ANGLE_X10_MIN;
+    g->sweep_running     = FALSE;
+    g->needle_visible    = FALSE;  /* gate the drawer until ui_gauge_sweep() */
+    g->data_valid        = FALSE;
 
     /* Root container fills the screen */
     g->root = lv_obj_create(parent);
@@ -292,7 +720,9 @@ OPERATE_RET ui_gauge_create(UI_GAUGE_T *g, lv_obj_t *parent,
     lv_obj_set_style_arc_width(g->arc, 6, LV_PART_MAIN);
     lv_obj_set_style_arc_width(g->arc, 6, LV_PART_INDICATOR);
 
-    /* Tick scale (numbers + ticks only; needle is drawn separately) */
+    /* Tick scale: ticks only. Built-in labels are disabled and replaced
+     * by __labels_create_all() / __labels_apply() below — see those
+     * function comments for why. */
     g->scale = lv_scale_create(g->root);
     lv_obj_set_size(g->scale, GAUGE_OUTER_R * 2 - 8, GAUGE_OUTER_R * 2 - 8);
     lv_obj_center(g->scale);
@@ -301,64 +731,102 @@ OPERATE_RET ui_gauge_create(UI_GAUGE_T *g, lv_obj_t *parent,
     lv_scale_set_rotation(g->scale, GAUGE_ANGLE_ROTATION);
     lv_scale_set_range(g->scale, val_min, val_max);
     __scale_apply_ticks(g->scale, tick_major);
-    lv_scale_set_label_show(g->scale, true);
+    lv_scale_set_label_show(g->scale, false);
     lv_obj_set_style_line_color(g->scale, UI_COLOR_TICK_DIM, LV_PART_ITEMS);
     lv_obj_set_style_line_width(g->scale, 2, LV_PART_ITEMS);
     lv_obj_set_style_length(g->scale, GAUGE_TICK_LEN_MINOR, LV_PART_ITEMS);
     lv_obj_set_style_line_color(g->scale, UI_COLOR_TICK, LV_PART_INDICATOR);
     lv_obj_set_style_line_width(g->scale, 4, LV_PART_INDICATOR);
     lv_obj_set_style_length(g->scale, GAUGE_TICK_LEN_MAJOR, LV_PART_INDICATOR);
-    lv_obj_set_style_text_color(g->scale, UI_COLOR_TEXT, LV_PART_INDICATOR);
-    lv_obj_set_style_text_font(g->scale, &lv_font_montserrat_22, LV_PART_INDICATOR);
-    lv_obj_set_style_pad_all(g->scale, GAUGE_LABEL_PAD, LV_PART_INDICATOR);
+
+    /* Manually-placed dial digits (replaces the scale's built-in labels).
+     * v1.8: pre-create the MAX number of label slots once and just rewrite
+     * them on subsequent set_def() calls, see __labels_create_all() docs. */
+    __labels_create_all(g);
+    __labels_apply(g, val_min, val_max, tick_major);
 
     /* Needle: transparent overlay obj that owns LV_EVENT_DRAW_MAIN.
      * Box is centred on the screen and just large enough to contain
-     * the rotated needle, so each invalidation only repaints that
-     * area instead of the whole 466x466 screen. */
+     * the rotated needle. Created HIDDEN — see file header
+     * "Visibility lifecycle" for the why. */
     g->needle = lv_obj_create(g->root);
     lv_obj_remove_style_all(g->needle);
     lv_obj_set_size(g->needle, GAUGE_NEEDLE_BOX, GAUGE_NEEDLE_BOX);
     lv_obj_center(g->needle);
     lv_obj_clear_flag(g->needle, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_clear_flag(g->needle, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(g->needle, LV_OBJ_FLAG_HIDDEN);
     lv_obj_set_user_data(g->needle, g);
     lv_obj_add_event_cb(g->needle, __needle_draw_event_cb,
                         LV_EVENT_DRAW_MAIN, NULL);
 
-    /* Hub: filled circle that sits on top of the needle base for a
-     * clean "no exposed back tail" look. Created AFTER the needle so
-     * it draws on top in z-order. */
-    g->hub = lv_obj_create(g->root);
-    lv_obj_remove_style_all(g->hub);
-    lv_obj_set_size(g->hub, GAUGE_HUB_R * 2, GAUGE_HUB_R * 2);
-    lv_obj_center(g->hub);
-    lv_obj_set_style_radius(g->hub, LV_RADIUS_CIRCLE, 0);
-    lv_obj_set_style_bg_color(g->hub, UI_COLOR_HUB, 0);
-    lv_obj_set_style_bg_opa(g->hub, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_color(g->hub, UI_COLOR_PRIMARY, 0);
-    lv_obj_set_style_border_width(g->hub, 3, 0);
+    /* Layered metallic hub — six stacked filled circles. They sit ABOVE
+     * the needle in the z-order so the needle's flat back is hidden
+     * under the inner face. The radii decrease ~4 px per layer so each
+     * layer is a 4-px-wide annulus visible as a distinct ring. The two
+     * darkest greys sandwich a brighter mid grey to simulate a domed
+     * metal cap with subtle specular hi-light. */
+    struct __HUB_LAYER_S {
+        lv_obj_t  **out;
+        int32_t     radius;
+        lv_color_t  color;
+    };
+    struct __HUB_LAYER_S hub_layers[] = {
+        { &g->hub_l0, GAUGE_HUB_R_RIM,  UI_COLOR_PRIMARY }, /* red rim */
+        { &g->hub_l1, GAUGE_HUB_R_DIM1, GAUGE_HUB_C_DIM1 },
+        { &g->hub_l2, GAUGE_HUB_R_DIM2, GAUGE_HUB_C_DIM2 },
+        { &g->hub_l3, GAUGE_HUB_R_MID,  GAUGE_HUB_C_MID  },
+        { &g->hub_l4, GAUGE_HUB_R_HI,   GAUGE_HUB_C_HI   }, /* hi-light */
+        { &g->hub_l5, GAUGE_HUB_R_FACE, UI_COLOR_HUB     }, /* near-black */
+    };
+    size_t hub_i;
+    for (hub_i = 0; hub_i < sizeof(hub_layers) / sizeof(hub_layers[0]); hub_i++) {
+        lv_obj_t *layer = lv_obj_create(g->root);
+        lv_obj_remove_style_all(layer);
+        lv_obj_set_size(layer,
+                        hub_layers[hub_i].radius * 2,
+                        hub_layers[hub_i].radius * 2);
+        lv_obj_center(layer);
+        lv_obj_set_style_radius(layer, LV_RADIUS_CIRCLE, 0);
+        lv_obj_set_style_bg_color(layer, hub_layers[hub_i].color, 0);
+        lv_obj_set_style_bg_opa(layer, LV_OPA_COVER, 0);
+        lv_obj_clear_flag(layer, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_clear_flag(layer, LV_OBJ_FLAG_CLICKABLE);
+        *hub_layers[hub_i].out = layer;
+    }
 
-    /* Title */
+    /* Title (e.g. VOLT / BAT / BOOST). v1.7 bumps the size from
+     * montserrat_22 to montserrat_28 (+27 % type) AND drops the BOTTOM
+     * offset from -195 to -150 (= 45 px DOWN, in the 40-60 px range the
+     * user asked for). At -195 with the montserrat_22 line-box the
+     * title top sat at y≈243 — INSIDE the Ø60 hub rim (rim bottom at
+     * y=263). Now the title's top is at y≈280, leaving ~17 px clearance
+     * to the hub's bottom and still ~7 px above the 48-pt value
+     * readout below. The whole text stack (title / value / unit) stays
+     * in the lower hemisphere, just better spaced. */
     g->label_title = lv_label_create(g->root);
     lv_label_set_text(g->label_title, title ? title : "");
     lv_obj_set_style_text_color(g->label_title, UI_COLOR_TEXT_DIM, 0);
-    lv_obj_set_style_text_font(g->label_title, &lv_font_montserrat_22, 0);
-    lv_obj_align(g->label_title, LV_ALIGN_TOP_MID, 0, 60);
+    lv_obj_set_style_text_font(g->label_title, &lv_font_montserrat_28, 0);
+    lv_obj_align(g->label_title, LV_ALIGN_BOTTOM_MID, 0, -150);
 
-    /* Live readout */
+    /* Live readout — moved DOWN by 47 px (≈ 10 % of 466 px panel). */
     g->label_value = lv_label_create(g->root);
     lv_label_set_text(g->label_value, "—");
     lv_obj_set_style_text_color(g->label_value, UI_COLOR_TEXT, 0);
     lv_obj_set_style_text_font(g->label_value, &lv_font_montserrat_48, 0);
-    lv_obj_align(g->label_value, LV_ALIGN_BOTTOM_MID, 0, -120);
+    lv_obj_align(g->label_value, LV_ALIGN_BOTTOM_MID, 0, -83);
 
-    /* Unit */
+    /* Unit — moved DOWN by 47 px to keep the value/unit pair together. */
     g->label_unit = lv_label_create(g->root);
     lv_label_set_text(g->label_unit, unit ? unit : "");
     lv_obj_set_style_text_color(g->label_unit, UI_COLOR_TEXT_DIM, 0);
     lv_obj_set_style_text_font(g->label_unit, &lv_font_montserrat_22, 0);
-    lv_obj_align(g->label_unit, LV_ALIGN_BOTTOM_MID, 0, -80);
+    lv_obj_align(g->label_unit, LV_ALIGN_BOTTOM_MID, 0, -41);
+
+    /* Persistent tracker — runs forever, paused by the sweep_running flag. */
+    g->track_timer = lv_timer_create(__track_timer_cb,
+                                     GAUGE_TRACK_PERIOD_MS, g);
 
     return OPRT_OK;
 }
@@ -381,16 +849,27 @@ OPERATE_RET ui_gauge_set_def(UI_GAUGE_T *g,
     if (g == NULL || g->scale == NULL || val_max <= val_min) {
         return OPRT_INVALID_PARM;
     }
-    /* Cancel any in-flight needle animation before changing the range. */
-    lv_anim_delete(g, __anim_angle_cb);
+    /* Cancel any in-flight sweep before changing the range. */
+    lv_anim_delete(g, __sweep_anim_cb);
+    g->sweep_running = FALSE;
 
     g->val_min = val_min;
     g->val_max = val_max;
     g->val_curr = val_min;
-    g->needle_angle_x10 = GAUGE_ANGLE_X10_MIN;
+    /* IMPORTANT: do NOT reset data_valid here. KEY-cycling gauges
+     * mid-flight should keep the existing needle visible and let the
+     * tracker glide smoothly from its current angle to the next
+     * gauge's live value. Resetting data_valid would cause the next
+     * set_value() to teleport, which the user explicitly disliked. */
+    /* Keep the visible angle where it is so the user doesn't see a snap when
+     * cycling gauges. The next set_value call will update the target and the
+     * tracker will glide smoothly from here to the new live position. */
+    g->needle_target_x10 = g->needle_angle_x10;
 
     lv_scale_set_range(g->scale, val_min, val_max);
     __scale_apply_ticks(g->scale, tick_major);
+    /* v1.8 — reuse the pre-created label slots, no alloc/free here. */
+    __labels_apply(g, val_min, val_max, tick_major);
 
     if (title && g->label_title) {
         lv_label_set_text(g->label_title, title);
@@ -401,19 +880,36 @@ OPERATE_RET ui_gauge_set_def(UI_GAUGE_T *g,
     if (g->label_value) {
         lv_label_set_text(g->label_value, "—");
     }
+    /* Full redraw + sync the dirty-area ring so the first tracker tick
+     * after a gauge swap doesn't accidentally invalidate a stale area. */
     lv_obj_invalidate(g->needle);
+    {
+        lv_area_t fresh;
+        __needle_compute_aabb(g, g->needle_angle_x10, &fresh);
+        __needle_dirty_ring_seed(g, &fresh);
+    }
     return OPRT_OK;
 }
 
 /**
- * @brief Animate the needle to a new value.
+ * @brief Update the needle target. The persistent tracker glides toward
+ *        it at 125 Hz; calling this every refresh tick is safe.
+ *
+ *  v1.6 behaviour change: the FIRST call after create()/sweep() does NOT
+ *  snap. We just update needle_target_x10 and let the tracker glide
+ *  from the resting MIN angle — so the user watches the needle slide
+ *  off the bottom-left into the live value, which is the "slow intro"
+ *  they asked for in problem 3 of the latest feedback.
+ *
+ *  The data_valid flag still flips on the first call so callers (e.g.
+ *  ui_gauge_set_def during gauge cycling) can tell whether a meaningful
+ *  reading has been delivered.
+ *
  * @param[in,out] g gauge
  * @param[in] value target value (clamped to [val_min, val_max])
- * @param[in] duration_ms animation duration; 0 = snap
+ * @param[in] duration_ms 0 = snap immediately. > 0 is a hint and is
+ *                        currently ignored — the tracker dictates motion.
  * @return none
- *
- * @note Same-target re-entry is filtered by an angular dead-band so the
- *       refresh tick can call this every 100 ms without restart-stutter.
  */
 void ui_gauge_set_value(UI_GAUGE_T *g, int32_t value, uint32_t duration_ms)
 {
@@ -423,35 +919,24 @@ void ui_gauge_set_value(UI_GAUGE_T *g, int32_t value, uint32_t duration_ms)
     int32_t target = __clamp(value, g->val_min, g->val_max);
     int32_t target_a = __value_to_angle_x10(g, target);
     g->val_curr = target;
+    g->needle_target_x10 = target_a;
 
-    /* Snap path */
+    if (!g->data_valid) {
+        g->data_valid = TRUE;
+        /* No snap. The tracker is already running (sweep_running = FALSE
+         * by now since the boot sweep completes before the first sample
+         * arrives) and will glide needle_angle_x10 from MIN toward
+         * target_a at the velocity-capped EMA rate. */
+        return;
+    }
+
     if (duration_ms == 0) {
-        if (target_a != g->needle_angle_x10) {
+        if (g->needle_angle_x10 != target_a) {
             g->needle_angle_x10 = target_a;
-            lv_obj_invalidate(g->needle);
+            __needle_invalidate_swept(g);
         }
-        return;
     }
-
-    /* Dead-band: ignore micro-jitter for short slews. */
-    int32_t delta = target_a - g->needle_angle_x10;
-    if (delta < 0) {
-        delta = -delta;
-    }
-    if (delta < GAUGE_DEADBAND_X10 && duration_ms < GAUGE_EASE_THRESH_MS) {
-        return;
-    }
-
-    lv_anim_init(&g->anim);
-    lv_anim_set_var(&g->anim, g);
-    lv_anim_set_exec_cb(&g->anim, __anim_angle_cb);
-    lv_anim_set_duration(&g->anim, duration_ms);
-    lv_anim_set_path_cb(&g->anim,
-                        (duration_ms >= GAUGE_EASE_THRESH_MS)
-                            ? lv_anim_path_ease_in_out
-                            : lv_anim_path_linear);
-    lv_anim_set_values(&g->anim, g->needle_angle_x10, target_a);
-    lv_anim_start(&g->anim);
+    /* duration_ms > 0: tracker handles the glide. */
 }
 
 /**
@@ -469,19 +954,44 @@ void ui_gauge_sweep(UI_GAUGE_T *g, uint32_t duration_ms)
         duration_ms = 200;
     }
 
-    /* Cancel any tracking animation that might race with the sweep. */
-    lv_anim_delete(g, __anim_angle_cb);
+    /* Cancel any prior sweep. */
+    lv_anim_delete(g, __sweep_anim_cb);
 
-    g->needle_angle_x10 = GAUGE_ANGLE_X10_MIN;
+    g->sweep_running     = TRUE;
+    g->needle_angle_x10  = GAUGE_ANGLE_X10_MIN;
+    g->needle_target_x10 = GAUGE_ANGLE_X10_MIN;
+    /* Flip the render-time visibility gate so the drawer starts painting
+     * the needle. From this point on it stays TRUE for the gauge's
+     * lifetime — after the sweep ends the needle parks at MIN, and the
+     * first set_value() glides it to the live value (no snap, no hide). */
+    g->needle_visible = TRUE;
+    /* Defensive: clear the LVGL hidden flag in case anything toggled it. */
+    if (lv_obj_has_flag(g->needle, LV_OBJ_FLAG_HIDDEN)) {
+        lv_obj_clear_flag(g->needle, LV_OBJ_FLAG_HIDDEN);
+    }
+    /* Force a full needle redraw at sweep start: the dirty-area ring may
+     * be stale (last tracker frame) or uninitialised (first run). The
+     * subsequent sweep frames do fine-grained AABB invalidation. Seeding
+     * BOTH ring slots with the MIN AABB ensures the very first sweep
+     * tick's __needle_invalidate_swept() correctly invalidates the MIN
+     * pose on BOTH framebuffers, eliminating the "tip residue at MIN"
+     * the user reported when the sweep starts moving away from MIN. */
     lv_obj_invalidate(g->needle);
+    {
+        lv_area_t initial;
+        __needle_compute_aabb(g, g->needle_angle_x10, &initial);
+        __needle_dirty_ring_seed(g, &initial);
+    }
 
     lv_anim_init(&g->anim);
     lv_anim_set_var(&g->anim, g);
-    lv_anim_set_exec_cb(&g->anim, __anim_angle_cb);
+    lv_anim_set_user_data(&g->anim, g);
+    lv_anim_set_exec_cb(&g->anim, __sweep_anim_cb);
     lv_anim_set_duration(&g->anim, duration_ms / 2);
     lv_anim_set_playback_duration(&g->anim, duration_ms / 2);
     lv_anim_set_path_cb(&g->anim, lv_anim_path_ease_in_out);
     lv_anim_set_values(&g->anim, GAUGE_ANGLE_X10_MIN, GAUGE_ANGLE_X10_MAX);
+    lv_anim_set_completed_cb(&g->anim, __sweep_ready_cb);
     lv_anim_start(&g->anim);
 }
 
@@ -541,7 +1051,18 @@ void ui_gauge_destroy(UI_GAUGE_T *g)
     if (g == NULL) {
         return;
     }
-    lv_anim_delete(g, __anim_angle_cb);
+    if (g->track_timer) {
+        lv_timer_delete(g->track_timer);
+        g->track_timer = NULL;
+    }
+    lv_anim_delete(g, __sweep_anim_cb);
+    /* Children get cleaned up when g->root is deleted; we just null the
+     * label pointers explicitly so any further access is defensive. */
+    int i;
+    for (i = 0; i < UI_GAUGE_MAX_LABELS; i++) {
+        g->labels[i] = NULL;
+    }
+    g->label_count = 0;
     if (g->root) {
         lv_obj_delete(g->root);
     }

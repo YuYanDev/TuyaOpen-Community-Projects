@@ -1,8 +1,8 @@
 /**
  * @file elm327_ble.c
  * @brief BLE central transport that exposes ELM327 over a transparent line pipe.
- * @version 1.0
- * @date 2026-04-27
+ * @version 1.1
+ * @date 2026-04-28
  * @copyright Copyright (c) Tuya Inc.
  *
  * Supported adapter families (BLE 4.0):
@@ -10,9 +10,15 @@
  *   - Vgate / OBDLink LX style     : service 0xFFF0, 0xFFF1=Notify, 0xFFF2=WriteNoRsp
  *   - Veepeak alt name / 18F0      : service 0x18F0, 0x2AF0=Notify, 0x2AF1=WriteNoRsp
  *
- * Classic Bluetooth (SPP) ELM327 v1.5 dongles are NOT supported.
+ * Classic Bluetooth (SPP) ELM327 v1.5 dongles are NOT served by this
+ * file — the SPP backend is in elm327_spp.c (v1.8 stub).
+ *
+ * v1.8 — also exports the OBD_IO_T BLE backend instance via
+ * obd_io_ble(). The vtable forwards to the same internal state, so
+ * both the legacy direct API and the unified vtable can coexist.
  */
 #include "elm327_ble.h"
+#include "obd_io.h"
 #include "app_config.h"
 #include "tal_api.h"
 #include "tkl_bluetooth.h"
@@ -52,7 +58,7 @@ typedef enum {
 } ELM_LINK_STATE_E;
 
 typedef struct {
-    ELM_BLE_CB           cb;
+    OBD_IO_CB            cb;
     ELM_LINK_STATE_E     state;
     MUTEX_HANDLE         lock;
 
@@ -91,15 +97,15 @@ STATIC VOID_T __on_gatt_evt(TKL_BLE_GATT_PARAMS_EVT_T *evt);
 /**
  * @brief Notify the application layer of an event.
  * @param[in] type event type
- * @param[in] line optional line buffer (only for ELM_BLE_EV_RX_LINE)
+ * @param[in] line optional line buffer (only for OBD_IO_EV_RX_LINE)
  * @return none
  */
-STATIC VOID_T __emit(ELM_BLE_EVENT_E type, char *line)
+STATIC VOID_T __emit(OBD_IO_EVENT_E type, const char *line)
 {
     if (s_ctx.cb == NULL) {
         return;
     }
-    ELM_BLE_EVENT_T e = {
+    OBD_IO_EVENT_T e = {
         .type = type,
         .rssi = s_ctx.peer_rssi,
         .line = line,
@@ -176,13 +182,13 @@ STATIC VOID_T __feed_rx(const uint8_t *data, uint16_t len)
         if (c == '\r' || c == '\n' || c == '>') {
             if (s_ctx.line_len > 0) {
                 s_ctx.line_buf[s_ctx.line_len] = '\0';
-                __emit(ELM_BLE_EV_RX_LINE, s_ctx.line_buf);
+                __emit(OBD_IO_EV_RX_LINE, s_ctx.line_buf);
                 s_ctx.line_len = 0;
             }
             if (c == '>') {
                 /* Forward an empty marker so consumer can detect end-of-frame */
-                static char prompt[2] = {'>', '\0'};
-                __emit(ELM_BLE_EV_RX_LINE, prompt);
+                static const char prompt[2] = {'>', '\0'};
+                __emit(OBD_IO_EV_RX_LINE, prompt);
             }
         } else if ((size_t)s_ctx.line_len + 1 < sizeof(s_ctx.line_buf)) {
             s_ctx.line_buf[s_ctx.line_len++] = c;
@@ -248,7 +254,7 @@ STATIC VOID_T __on_gap_evt(TKL_BLE_GAP_PARAMS_EVT_T *evt)
         memcpy(&s_ctx.peer_addr, &r->peer_addr, sizeof(TKL_BLE_GAP_ADDR_T));
         s_ctx.peer_rssi = r->rssi;
         ELM_LOG("found adapter rssi=%d", r->rssi);
-        __emit(ELM_BLE_EV_DEVICE_FOUND, NULL);
+        __emit(OBD_IO_EV_DEVICE_FOUND, NULL);
 
         tkl_ble_gap_scan_stop();
 
@@ -266,11 +272,11 @@ STATIC VOID_T __on_gap_evt(TKL_BLE_GAP_PARAMS_EVT_T *evt)
             .connection_timeout = 5000,
         };
         s_ctx.state = LST_CONNECTING;
-        __emit(ELM_BLE_EV_CONNECTING, NULL);
+        __emit(OBD_IO_EV_CONNECTING, NULL);
         if (tkl_ble_gap_connect(&s_ctx.peer_addr, &sp, &cp) != OPRT_OK) {
             ELM_WARN("connect kickoff failed");
             s_ctx.state = LST_IDLE;
-            __emit(ELM_BLE_EV_DISCONNECTED, NULL);
+            __emit(OBD_IO_EV_DISCONNECTED, NULL);
         }
     } break;
 
@@ -290,7 +296,7 @@ STATIC VOID_T __on_gap_evt(TKL_BLE_GAP_PARAMS_EVT_T *evt)
         s_ctx.notify_handle = 0;
         s_ctx.cccd_handle = 0;
         s_ctx.line_len = 0;
-        __emit(ELM_BLE_EV_DISCONNECTED, NULL);
+        __emit(OBD_IO_EV_DISCONNECTED, NULL);
         break;
 
     default:
@@ -390,7 +396,7 @@ STATIC VOID_T __on_gatt_evt(TKL_BLE_GATT_PARAMS_EVT_T *evt)
             tkl_ble_gattc_write_without_rsp(s_ctx.conn_handle, s_ctx.cccd_handle, en, 2);
         }
         s_ctx.state = LST_READY;
-        __emit(ELM_BLE_EV_CONNECTED, NULL);
+        __emit(OBD_IO_EV_CONNECTED, NULL);
     } break;
 
     case TKL_BLE_GATT_EVT_NOTIFY_INDICATE_RX: {
@@ -415,7 +421,7 @@ STATIC VOID_T __on_gatt_evt(TKL_BLE_GATT_PARAMS_EVT_T *evt)
 /**
  * @brief Init BLE stack and prepare context.
  */
-OPERATE_RET elm327_ble_init(ELM_BLE_CB cb)
+OPERATE_RET elm327_ble_init(OBD_IO_CB cb)
 {
     if (s_ctx.lock != NULL) {
         s_ctx.cb = cb;
@@ -466,7 +472,7 @@ OPERATE_RET elm327_ble_scan_start(const uint8_t *preferred_addr)
     };
     OPERATE_RET rt = tkl_ble_gap_scan_start(&sp);
     if (rt == OPRT_OK) {
-        __emit(ELM_BLE_EV_SCAN_STARTED, NULL);
+        __emit(OBD_IO_EV_SCAN_STARTED, NULL);
     } else {
         s_ctx.state = LST_IDLE;
     }
@@ -524,4 +530,33 @@ OPERATE_RET elm327_ble_send(const char *str)
 BOOL_T elm327_ble_is_connected(VOID_T)
 {
     return (s_ctx.state == LST_READY) ? TRUE : FALSE;
+}
+
+/* ---------------------------------------------------------------------------
+ * OBD_IO_T vtable export
+ * --------------------------------------------------------------------------- */
+/**
+ * @brief Static BLE backend instance for the unified OBD_IO_T vtable.
+ *
+ * Each method is a thin trampoline to the matching elm327_ble_*
+ * function so existing direct-call sites continue to work while new
+ * callers (obd_session) speak only via the vtable.
+ */
+STATIC const OBD_IO_T s_io_ble = {
+    .name         = "BLE",
+    .init         = elm327_ble_init,
+    .scan_start   = elm327_ble_scan_start,
+    .scan_stop    = elm327_ble_scan_stop,
+    .disconnect   = elm327_ble_disconnect,
+    .send         = elm327_ble_send,
+    .is_connected = elm327_ble_is_connected,
+};
+
+/**
+ * @brief Get the BLE backend vtable instance.
+ * @return non-NULL pointer to s_io_ble
+ */
+const OBD_IO_T *obd_io_ble(VOID_T)
+{
+    return &s_io_ble;
 }

@@ -44,6 +44,13 @@ STATIC VOID_T __prefs_default(APP_PREFS_T *p)
     p->unit_press = APP_UNIT_PRESS_KPA;
     p->mock_enabled = 0;
     p->bound_addr_valid = 0;
+    p->g_offset_mg[0] = 0;
+    p->g_offset_mg[1] = 0;
+    p->g_offset_mg[2] = 0;
+    p->g_offset_valid = 0;
+    p->g_orient = (uint8_t)APP_G_ORIENT_FACE_UP;
+    p->bt_mode  = (uint8_t)OBD_BT_MODE_BLE;
+    p->lang     = 0;     /* APP_LANG_EN — keep app_i18n.h out of this TU */
 }
 
 /**
@@ -83,6 +90,15 @@ OPERATE_RET app_kv_init(VOID_T)
                 }
                 if (s_prefs.current_gauge >= APP_METRIC_COUNT) {
                     s_prefs.current_gauge = APP_METRIC_WATER_TEMP;
+                }
+                if (s_prefs.g_orient >= APP_G_ORIENT_COUNT) {
+                    s_prefs.g_orient = (uint8_t)APP_G_ORIENT_FACE_UP;
+                }
+                if (s_prefs.bt_mode >= OBD_BT_MODE_COUNT) {
+                    s_prefs.bt_mode = (uint8_t)OBD_BT_MODE_BLE;
+                }
+                if (s_prefs.lang >= 2) {     /* APP_LANG_COUNT */
+                    s_prefs.lang = 0;        /* APP_LANG_EN */
                 }
             } else {
                 PR_WARN("prefs size mismatch (got %u, want %u), reset to defaults",
@@ -219,5 +235,80 @@ OPERATE_RET app_kv_clear_bound_addr(VOID_T)
     }
     memset(s_prefs.bound_addr, 0, sizeof(s_prefs.bound_addr));
     s_prefs.bound_addr_valid = 0;
+    return app_kv_save();
+}
+
+/**
+ * @brief Persist a fresh G zero-calibration triplet.
+ */
+OPERATE_RET app_kv_set_g_offset(int16_t x_mg, int16_t y_mg, int16_t z_mg)
+{
+    if (!s_inited) {
+        app_kv_init();
+    }
+    s_prefs.g_offset_mg[0] = x_mg;
+    s_prefs.g_offset_mg[1] = y_mg;
+    s_prefs.g_offset_mg[2] = z_mg;
+    s_prefs.g_offset_valid = 1;
+    return app_kv_save();
+}
+
+/**
+ * @brief Discard user G calibration (revert to factory zeros).
+ */
+OPERATE_RET app_kv_clear_g_offset(VOID_T)
+{
+    if (!s_inited) {
+        app_kv_init();
+    }
+    s_prefs.g_offset_mg[0] = 0;
+    s_prefs.g_offset_mg[1] = 0;
+    s_prefs.g_offset_mg[2] = 0;
+    s_prefs.g_offset_valid = 0;
+    return app_kv_save();
+}
+
+/**
+ * @brief Set the device mounting orientation enum.
+ */
+OPERATE_RET app_kv_set_g_orient(APP_G_ORIENT_E orient)
+{
+    if (!s_inited) {
+        app_kv_init();
+    }
+    if ((unsigned)orient >= (unsigned)APP_G_ORIENT_COUNT) {
+        return OPRT_INVALID_PARM;
+    }
+    s_prefs.g_orient = (uint8_t)orient;
+    return app_kv_save();
+}
+
+/**
+ * @brief Set the OBD Bluetooth backend mode enum.
+ */
+OPERATE_RET app_kv_set_bt_mode(OBD_BT_MODE_E mode)
+{
+    if (!s_inited) {
+        app_kv_init();
+    }
+    if ((unsigned)mode >= (unsigned)OBD_BT_MODE_COUNT) {
+        return OPRT_INVALID_PARM;
+    }
+    s_prefs.bt_mode = (uint8_t)mode;
+    return app_kv_save();
+}
+
+/**
+ * @brief Set the UI language enum (kept as uint8_t to dodge include cycle).
+ */
+OPERATE_RET app_kv_set_lang(uint8_t lang)
+{
+    if (!s_inited) {
+        app_kv_init();
+    }
+    if (lang >= 2) {     /* APP_LANG_COUNT */
+        return OPRT_INVALID_PARM;
+    }
+    s_prefs.lang = lang;
     return app_kv_save();
 }

@@ -14,11 +14,20 @@
  *   WAIT_LINK     : "Waiting for OBD adapter" spinner overlay
  *      └─> MAIN    when obd_session reports READY (smooth pointer transition)
  *
- *   MAIN          : single full-screen gauge, KEY cycles, PWR-long opens menu
- *      └─> MENU    on PWR long press
+ *   MAIN          : single full-screen gauge
+ *      └─> MENU    on PWR short press (toggle)
  *
- *   MENU          : navigable list (Mock toggle, gauges, brightness, forget)
- *      └─> MAIN    on PWR long press / "Back" item
+ *   MENU          : touch-only menu (Mock toggle, brightness, forget, close)
+ *      └─> MAIN/WAIT_LINK on PWR short press (toggle) or "Close" item
+ *
+ * Button mapping (final):
+ *   PWR short  : toggle menu (any state except BOOT_SWEEP)
+ *   PWR long3s : graceful shutdown
+ *   KEY short  : switch to next enabled gauge (MAIN / WAIT_LINK only)
+ *
+ * Inside the menu, only the touchscreen is used to manipulate items; the
+ * KEY button is intentionally inert to keep "KEY = switch gauge" as a
+ * single-purpose mental model.
  *
  * @note All LVGL access goes through lv_vendor_disp_lock/unlock in callers.
  *       The UI refresh timer runs in the LVGL task itself, so its callback
@@ -26,12 +35,15 @@
  */
 #include "ui.h"
 #include "ui_gauge.h"
+#include "ui_gforce.h"
 #include "ui_theme.h"
 #include "app_config.h"
 #include "app_metric.h"
 #include "app_kv.h"
+#include "app_i18n.h"
 #include "app_mock.h"
 #include "obd_session.h"
+#include "sensor_imu.h"
 #include "lv_vendor.h"
 #include "lvgl.h"
 #include "tal_api.h"
@@ -67,9 +79,13 @@ typedef struct {
 typedef enum {
     MENU_MOCK = 0,
     MENU_BRIGHT,
-    MENU_GAUGES,
+    MENU_GCAL,           /**< Calibrate G zero (per-orientation static bias) */
+    MENU_ORIENT,         /**< Cycle device mounting orientation (5 presets) */
+    MENU_BT_MODE,        /**< Toggle OBD transport: BLE 4.0 / BT-Classic SPP */
+    MENU_BT_PAIR,        /**< Trigger SPP legacy PIN pairing (1234 / 0000) */
+    MENU_LANG,           /**< Cycle UI language (English / 中文) */
     MENU_FORGET,
-    MENU_BACK,
+    MENU_CLOSE,
     MENU_COUNT
 } UI_MENU_E;
 
@@ -83,15 +99,14 @@ STATIC lv_obj_t     *s_overlay = NULL;        /* BLE waiting overlay */
 STATIC lv_obj_t     *s_overlay_label = NULL;
 STATIC lv_obj_t     *s_overlay_dots = NULL;
 STATIC lv_obj_t     *s_overlay_spinner = NULL;
-STATIC lv_obj_t     *s_status_bar = NULL;     /* small status row top of dial */
-STATIC lv_obj_t     *s_lbl_bt = NULL;         /* BT indicator */
-STATIC lv_obj_t     *s_lbl_src = NULL;        /* MOCK / OBD tag */
 
 STATIC lv_obj_t     *s_menu_root = NULL;
-STATIC lv_obj_t     *s_menu_items[MENU_COUNT] = {NULL};
-STATIC int           s_menu_cursor = 0;
+STATIC lv_obj_t     *s_menu_title = NULL;
+STATIC lv_obj_t     *s_menu_items[MENU_COUNT]  = {NULL};
+STATIC lv_obj_t     *s_menu_labels[MENU_COUNT] = {NULL};
 
-STATIC UI_GAUGE_T    s_gauge;                 /* single live gauge */
+STATIC UI_GAUGE_T    s_gauge;                 /* dial gauge for non-G metrics */
+STATIC UI_GFORCE_T   s_gforce;                /* GoPro-style G target reticle */
 STATIC int           s_curr_gauge_idx = 0;    /* index into s_gauge_defs */
 STATIC BOOL_T        s_first_value_after_link = TRUE;
 STATIC uint32_t      s_boot_elapsed_ms = 0;   /* time since BOOT_SWEEP entered */
@@ -120,8 +135,9 @@ STATIC VOID_T __overlay_show(BOOL_T show);
 STATIC VOID_T __overlay_set_state_text(OBD_SES_STATE_E st);
 STATIC VOID_T __menu_show(BOOL_T show);
 STATIC VOID_T __menu_redraw(VOID_T);
+STATIC VOID_T __menu_item_clicked(lv_event_t *e);
 STATIC VOID_T __apply_current_gauge(BOOL_T animate_in);
-STATIC int   __next_enabled_gauge(int from);
+STATIC int    __next_enabled_gauge(int from);
 STATIC UI_STATE_E __compute_live_state(VOID_T);
 STATIC VOID_T __enter_live_state(UI_STATE_E target);
 
@@ -200,13 +216,17 @@ STATIC BOOL_T __metric_user_value(const APP_METRIC_BUS_T *bus,
     case APP_METRIC_VOLTAGE:      raw = bus->voltage_mv;  break;
     case APP_METRIC_BOOST:        raw = bus->boost_kpa10; break;
     case APP_METRIC_G_FORCE: {
-        int32_t gx = bus->g_x_mg;
-        int32_t gy = bus->g_y_mg;
-        /* magnitude in milli-g, sign by larger axis */
-        int32_t ax = (gx < 0) ? -gx : gx;
-        int32_t ay = (gy < 0) ? -gy : gy;
-        int32_t mag = (ax > ay) ? ax : ay;
-        raw = (gy < 0) ? -mag : mag;
+        /* v1.8: feed off the orient-projected axes so the magnitude is
+         * truly vehicle-centric — independent of how the device is
+         * physically mounted. Sign convention: forward (+) is "nose
+         * accelerating" (i.e. the gas pedal direction), so a hard
+         * brake reads negative on the dial. */
+        int32_t gfwd = bus->g_fwd_mg;
+        int32_t glat = bus->g_lat_mg;
+        int32_t af = (gfwd < 0) ? -gfwd : gfwd;
+        int32_t al = (glat < 0) ? -glat : glat;
+        int32_t mag = (af > al) ? af : al;
+        raw = (gfwd < 0) ? -mag : mag;
     } break;
     default: raw = 0; break;
     }
@@ -251,9 +271,9 @@ STATIC int __next_enabled_gauge(int from)
 /**
  * @brief (Re)apply the current gauge config to the live widget.
  *
- * Reconfigures range/title/unit/ticks in-place via ui_gauge_set_def, which
- * is much cheaper than destroy+create and avoids a perceptible flash when
- * the user cycles gauges with the KEY button.
+ * For all dial metrics this reconfigures range/title/unit/ticks in-place
+ * via ui_gauge_set_def() (much cheaper than destroy+create). For the G
+ * metric we hide the dial and show the GoPro target reticle instead.
  *
  * @param[in] animate_in TRUE to smoothly slew the needle to the live value.
  * @return none
@@ -261,10 +281,23 @@ STATIC int __next_enabled_gauge(int from)
 STATIC VOID_T __apply_current_gauge(BOOL_T animate_in)
 {
     const UI_GAUGE_DEF_T *d = &s_gauge_defs[s_curr_gauge_idx];
-    if (s_gauge.root == NULL) {
+
+    BOOL_T is_gforce = (d->metric == APP_METRIC_G_FORCE);
+
+    if (is_gforce) {
+        ui_gauge_set_visible(&s_gauge, FALSE);
+        ui_gforce_set_visible(&s_gforce, TRUE);
+        ui_gforce_set_uncalibrated_hint(&s_gforce,
+                                        sensor_imu_calibration_active() ? FALSE : TRUE);
         return;
     }
 
+    /* Non-G dial gauge */
+    ui_gforce_set_visible(&s_gforce, FALSE);
+    ui_gauge_set_visible(&s_gauge, TRUE);
+    if (s_gauge.root == NULL) {
+        return;
+    }
     ui_gauge_set_def(&s_gauge, d->title, d->unit,
                      d->v_min, d->v_max, d->ticks);
 
@@ -312,15 +345,19 @@ STATIC VOID_T __build_overlay(VOID_T)
     lv_obj_set_style_arc_width(s_overlay_spinner, 6, LV_PART_INDICATOR);
 
     s_overlay_label = lv_label_create(s_overlay);
-    lv_label_set_text(s_overlay_label, "Connecting OBD");
     lv_obj_set_style_text_color(s_overlay_label, UI_COLOR_TEXT, 0);
-    lv_obj_set_style_text_font(s_overlay_label, &lv_font_montserrat_28, 0);
+    /* font_default tracks the active language: Montserrat 16 for EN,
+     * SimSun 16 CJK for ZH. We can't use Montserrat 28 here any more
+     * because LVGL only ships one CJK glyph size and we need a
+     * matching pair so the metrics line up after a lang flip. */
+    lv_obj_set_style_text_font(s_overlay_label, app_i18n_font_default(), 0);
+    lv_label_set_text(s_overlay_label, app_i18n_get(STR_OVL_CONNECTING));
     lv_obj_align(s_overlay_label, LV_ALIGN_CENTER, 0, 30);
 
     s_overlay_dots = lv_label_create(s_overlay);
-    lv_label_set_text(s_overlay_dots, "Searching for ELM327 BLE…");
     lv_obj_set_style_text_color(s_overlay_dots, UI_COLOR_TEXT_DIM, 0);
-    lv_obj_set_style_text_font(s_overlay_dots, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_font(s_overlay_dots, app_i18n_font_default(), 0);
+    lv_label_set_text(s_overlay_dots, app_i18n_get(STR_OVL_SEARCHING));
     lv_obj_align(s_overlay_dots, LV_ALIGN_CENTER, 0, 70);
 }
 
@@ -350,34 +387,140 @@ STATIC VOID_T __overlay_set_state_text(OBD_SES_STATE_E st)
     if (s_overlay_label == NULL) {
         return;
     }
-    static const char *HINT = "Hold PWR for menu  ·  KEY: switch gauge";
+    const char *hint = app_i18n_get(STR_OVL_HINT);
+    APP_STR_E hdr_id = STR_OVL_CONNECTING;
     switch (st) {
-    case OBD_SES_OFF:
-        lv_label_set_text(s_overlay_label, "OBD off");
-        lv_label_set_text(s_overlay_dots,  HINT);
-        break;
-    case OBD_SES_SCAN:
-        lv_label_set_text(s_overlay_label, "Connecting OBD");
-        lv_label_set_text(s_overlay_dots,  HINT);
-        break;
-    case OBD_SES_LINKED:
-        lv_label_set_text(s_overlay_label, "Configuring");
-        lv_label_set_text(s_overlay_dots,  HINT);
-        break;
-    case OBD_SES_LINK_LOST:
-        lv_label_set_text(s_overlay_label, "Link lost");
-        lv_label_set_text(s_overlay_dots,  HINT);
-        break;
-    default:
-        break;
+    case OBD_SES_OFF:        hdr_id = STR_OVL_OBD_OFF;     break;
+    case OBD_SES_SCAN:       hdr_id = STR_OVL_CONNECTING;  break;
+    case OBD_SES_LINKED:     hdr_id = STR_OVL_CONFIGURING; break;
+    case OBD_SES_LINK_LOST:  hdr_id = STR_OVL_LINK_LOST;   break;
+    default: return;
     }
+    lv_label_set_text(s_overlay_label, app_i18n_get(hdr_id));
+    lv_label_set_text(s_overlay_dots,  hint);
 }
 
 /* ---------------------------------------------------------------------------
- * Menu
+ * Menu (touchscreen-only; KEY/PWR don't navigate inside it)
  * --------------------------------------------------------------------------- */
 /**
- * @brief Build the menu screen (initially hidden).
+ * @brief LV_EVENT_CLICKED handler shared by all menu rows. The row index
+ *        was stored in user_data when the row was created.
+ *
+ * @param[in] e LVGL event handle
+ * @return none
+ * @note Runs in LVGL task context (touch input is dispatched there) so no
+ *       additional locking is required when calling app_kv / obd_session.
+ */
+STATIC VOID_T __menu_item_clicked(lv_event_t *e)
+{
+    int idx = (int)(intptr_t)lv_event_get_user_data(e);
+    if (idx < 0 || idx >= MENU_COUNT) {
+        return;
+    }
+
+    switch ((UI_MENU_E)idx) {
+    case MENU_MOCK: {
+        const APP_PREFS_T *p = app_kv_prefs();
+        BOOL_T en = (p && p->mock_enabled) ? FALSE : TRUE;
+        app_kv_set_mock_enabled(en);
+        ui_on_mock_changed(en);
+    } break;
+    case MENU_BRIGHT: {
+        const APP_PREFS_T *p = app_kv_prefs();
+        uint8_t b = p ? p->brightness_pct : 50;
+        b = (b >= 100) ? 20 : (uint8_t)(b + 20);
+        app_kv_set_brightness(b);
+    } break;
+    case MENU_GCAL: {
+        /* Capture the current static gravity vector as the new zero. The
+         * IMU sample loop services the request on its next 20 ms tick
+         * and persists into KV — see sensor_imu_calibrate_zero(). */
+        OPERATE_RET rt = sensor_imu_calibrate_zero();
+        if (rt != OPRT_OK) {
+            UI_LOG("calibrate-zero rejected (rt=%d) — IMU not running", rt);
+        }
+    } break;
+    case MENU_ORIENT: {
+        /* Cycle through the 5 mounting orientations. The IMU sampler
+         * picks up the new value on its next 20 ms tick (it reads the
+         * KV pointer each iteration), so the GoPro ball will start
+         * responding to the new fwd/lat axes immediately. The user
+         * should re-tap "Calibrate G" after switching pose so static
+         * gravity bias is zeroed for the new orientation. */
+        const APP_PREFS_T *p = app_kv_prefs();
+        uint8_t cur = p ? p->g_orient : (uint8_t)APP_G_ORIENT_FACE_UP;
+        uint8_t nxt = (uint8_t)((cur + 1) % (uint8_t)APP_G_ORIENT_COUNT);
+        app_kv_set_g_orient((APP_G_ORIENT_E)nxt);
+    } break;
+    case MENU_BT_MODE: {
+        /* Toggle BLE ↔ SPP and ask the OBD session to re-pick the
+         * backend on its next iteration. For v1.8 the SPP backend is
+         * a stub that surfaces NOT_SUPPORTED to the overlay, so the
+         * user can experiment with the toggle freely without
+         * "bricking" their OBD link — flipping back to BLE always
+         * restores the working transport. */
+        const APP_PREFS_T *p = app_kv_prefs();
+        uint8_t cur = p ? p->bt_mode : (uint8_t)OBD_BT_MODE_BLE;
+        uint8_t nxt = (uint8_t)((cur + 1) % (uint8_t)OBD_BT_MODE_COUNT);
+        app_kv_set_bt_mode((OBD_BT_MODE_E)nxt);
+        obd_session_rescan();
+    } break;
+    case MENU_BT_PAIR: {
+        /* SPP legacy PIN entry. The v1.8 stub backend can't actually
+         * pair, but the menu row still triggers a rescan so the
+         * upcoming v1.9 implementation will Just Work without UI
+         * changes. Users on BLE see a "not applicable" hint. */
+        const APP_PREFS_T *p = app_kv_prefs();
+        if (p && p->bt_mode == (uint8_t)OBD_BT_MODE_SPP) {
+            obd_session_rescan();
+        } else {
+            UI_LOG("BT pair: ignored (current backend is BLE, no PIN needed)");
+        }
+    } break;
+    case MENU_LANG: {
+        /* Cycle EN <-> ZH and reflow every visible label's font.
+         * Without the font reflow, switching to ZH would render
+         * Chinese codepoints as missing-glyph boxes because the
+         * Montserrat tables don't contain the CJK range. */
+        APP_LANG_E cur = app_i18n_lang();
+        APP_LANG_E nxt = (cur == APP_LANG_EN) ? APP_LANG_ZH : APP_LANG_EN;
+        app_i18n_set_lang(nxt);
+        const lv_font_t *f = app_i18n_font_default();
+        if (s_menu_title) {
+            lv_obj_set_style_text_font(s_menu_title, f, 0);
+        }
+        for (int j = 0; j < MENU_COUNT; j++) {
+            if (s_menu_labels[j]) {
+                lv_obj_set_style_text_font(s_menu_labels[j], f, 0);
+            }
+        }
+        if (s_overlay_label) {
+            lv_obj_set_style_text_font(s_overlay_label, f, 0);
+        }
+        if (s_overlay_dots) {
+            lv_obj_set_style_text_font(s_overlay_dots, f, 0);
+        }
+    } break;
+    case MENU_FORGET:
+        app_kv_clear_bound_addr();
+        obd_session_rescan();
+        break;
+    case MENU_CLOSE:
+        ui_toggle_menu();   /* close + restore live state */
+        return;
+    default:
+        break;
+    }
+    __menu_redraw();
+    obd_session_refresh_poll_list();
+}
+
+/**
+ * @brief Build the menu screen (initially hidden). Each row is a clickable
+ *        rounded card with a centred label.
+ *
+ * @return none
  */
 STATIC VOID_T __build_menu(VOID_T)
 {
@@ -387,35 +530,80 @@ STATIC VOID_T __build_menu(VOID_T)
     lv_obj_center(s_menu_root);
     lv_obj_set_style_bg_color(s_menu_root, UI_COLOR_BG, 0);
     lv_obj_set_style_bg_opa(s_menu_root, LV_OPA_COVER, 0);
-    lv_obj_clear_flag(s_menu_root, LV_OBJ_FLAG_SCROLLABLE);
+    /* v1.8 — enable vertical touch-scroll. With 8 rows (P5C added BT
+     * mode + BT pair) we exceed the round display's inscribed safe
+     * area, so we rely on the user dragging the list. The scrollbar
+     * is left at LVGL defaults (auto-hide) which feels native on a
+     * round AMOLED. */
+    lv_obj_add_flag(s_menu_root, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scroll_dir(s_menu_root, LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(s_menu_root, LV_SCROLLBAR_MODE_AUTO);
     lv_obj_add_flag(s_menu_root, LV_OBJ_FLAG_HIDDEN);
 
-    lv_obj_t *title = lv_label_create(s_menu_root);
-    lv_label_set_text(title, "MENU");
-    lv_obj_set_style_text_color(title, UI_COLOR_TEXT, 0);
-    lv_obj_set_style_text_font(title, &lv_font_montserrat_28, 0);
-    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 70);
+    s_menu_title = lv_label_create(s_menu_root);
+    lv_obj_set_style_text_color(s_menu_title, UI_COLOR_TEXT, 0);
+    lv_obj_set_style_text_font(s_menu_title, app_i18n_font_default(), 0);
+    lv_label_set_text(s_menu_title, app_i18n_get(STR_MENU_TITLE));
+    lv_obj_align(s_menu_title, LV_ALIGN_TOP_MID, 0, 30);
 
-    static const char *labels[MENU_COUNT] = {
-        "Mock Mode",
-        "Brightness +",
-        "Cycle Gauges",
-        "Forget Adapter",
-        "Back",
-    };
-    int y = 150;
-    for (int i = 0; i < MENU_COUNT; i++) {
-        lv_obj_t *row = lv_label_create(s_menu_root);
-        lv_label_set_text(row, labels[i]);
-        lv_obj_set_style_text_font(row, &lv_font_montserrat_22, 0);
+    /* Round display: 8 rows (Mock / Bright / GCal / Orient / BT mode /
+     * BT pair / Forget / Close). Even the first 6 fit the inscribed
+     * 233 px circle by themselves; the remaining 2 spill below the
+     * visible area and become reachable by dragging the list up.
+     * ROW_W is shrunk to 290 px so the rounded corners land inside
+     * the rim at the top and bottom edges of the visible portion. */
+    static const int ROW_W = 290;
+    static const int ROW_H = 44;
+    static const int ROW_GAP = 6;
+    int y = 70;
+    int i;
+    for (i = 0; i < MENU_COUNT; i++) {
+        lv_obj_t *row = lv_obj_create(s_menu_root);
+        lv_obj_remove_style_all(row);
+        lv_obj_set_size(row, ROW_W, ROW_H);
         lv_obj_align(row, LV_ALIGN_TOP_MID, 0, y);
-        s_menu_items[i] = row;
-        y += 38;
+        lv_obj_set_style_bg_color(row, UI_COLOR_HUB, 0);
+        lv_obj_set_style_bg_opa(row, LV_OPA_COVER, 0);
+        lv_obj_set_style_radius(row, 16, 0);
+        lv_obj_set_style_pad_all(row, 8, 0);
+        lv_obj_set_style_border_color(row, UI_COLOR_TICK_DIM, 0);
+        lv_obj_set_style_border_width(row, 1, 0);
+        /* Touch feedback: brighten on press */
+        lv_obj_set_style_bg_color(row, UI_COLOR_PRIMARY, LV_STATE_PRESSED);
+        lv_obj_set_style_border_color(row, UI_COLOR_PRIMARY, LV_STATE_PRESSED);
+
+        lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+
+        lv_obj_t *lbl = lv_label_create(row);
+        lv_obj_set_style_text_color(lbl, UI_COLOR_TEXT, 0);
+        /* Font is sourced from i18n so a language flip immediately
+         * picks up the right glyph table (Montserrat 16 for Latin,
+         * SimSun 16 CJK for Chinese). Same metrics for both, so the
+         * row layout doesn't shift. */
+        lv_obj_set_style_text_font(lbl, app_i18n_font_default(), 0);
+        lv_label_set_text(lbl, "");
+        lv_obj_center(lbl);
+
+        s_menu_items[i]  = row;
+        s_menu_labels[i] = lbl;
+
+        lv_obj_add_event_cb(row, __menu_item_clicked,
+                            LV_EVENT_CLICKED, (void *)(intptr_t)i);
+
+        y += ROW_H + ROW_GAP;
     }
 }
 
 /**
- * @brief Re-render menu items, highlighting the current cursor row.
+ * @brief Re-render the menu item labels with the current preferences.
+ *
+ * Pulls every visible string through app_i18n_get() so a Chinese
+ * lang flip via MENU_LANG instantly retranslates the entire menu.
+ * The runtime values (ON/OFF, brightness %, …) stay Latin to match
+ * the dial labels and avoid the SimSun font having to cover digits.
+ *
+ * @return none
  */
 STATIC VOID_T __menu_redraw(VOID_T)
 {
@@ -424,50 +612,102 @@ STATIC VOID_T __menu_redraw(VOID_T)
     }
     const APP_PREFS_T *p = app_kv_prefs();
 
-    char buf[64];
-    for (int i = 0; i < MENU_COUNT; i++) {
-        if (s_menu_items[i] == NULL) {
+    if (s_menu_title) {
+        lv_label_set_text(s_menu_title, app_i18n_get(STR_MENU_TITLE));
+    }
+
+    char buf[80];
+    int i;
+    for (i = 0; i < MENU_COUNT; i++) {
+        if (s_menu_labels[i] == NULL) {
             continue;
         }
         switch ((UI_MENU_E)i) {
         case MENU_MOCK:
-            snprintf(buf, sizeof(buf), "Mock Mode : %s",
+            snprintf(buf, sizeof(buf), "%s%s",
+                     app_i18n_get(STR_MENU_MOCK),
                      (p && p->mock_enabled) ? "ON" : "OFF");
             break;
         case MENU_BRIGHT:
-            snprintf(buf, sizeof(buf), "Brightness : %d%%",
+            snprintf(buf, sizeof(buf), "%s%d%%",
+                     app_i18n_get(STR_MENU_BRIGHT),
                      p ? p->brightness_pct : 0);
             break;
-        case MENU_GAUGES: {
-            int n = 0;
-            if (p) {
-                for (int k = 0; k < APP_METRIC_COUNT; k++) {
-                    if (p->gauge_enabled_mask & (1u << k)) {
-                        n++;
-                    }
-                }
+        case MENU_GCAL: {
+            BOOL_T cal_on = sensor_imu_calibration_active();
+            snprintf(buf, sizeof(buf), "%s%s",
+                     app_i18n_get(STR_MENU_GCAL),
+                     app_i18n_get(cal_on ? STR_MENU_GCAL_HINT_SAVED
+                                         : STR_MENU_GCAL_HINT_TAP));
+        } break;
+        case MENU_ORIENT: {
+            static const APP_STR_E k_orient_ids[APP_G_ORIENT_COUNT] = {
+                [APP_G_ORIENT_FACE_UP]  = STR_ORIENT_FACE_UP,
+                [APP_G_ORIENT_USER_0]   = STR_ORIENT_USER_0,
+                [APP_G_ORIENT_USER_90]  = STR_ORIENT_USER_90,
+                [APP_G_ORIENT_USER_180] = STR_ORIENT_USER_180,
+                [APP_G_ORIENT_USER_270] = STR_ORIENT_USER_270,
+            };
+            uint8_t o = p ? p->g_orient : (uint8_t)APP_G_ORIENT_FACE_UP;
+            if (o >= APP_G_ORIENT_COUNT) {
+                o = (uint8_t)APP_G_ORIENT_FACE_UP;
             }
-            snprintf(buf, sizeof(buf), "Gauges Enabled : %d/%d", n, APP_METRIC_COUNT);
+            snprintf(buf, sizeof(buf), "%s%s",
+                     app_i18n_get(STR_MENU_ORIENT),
+                     app_i18n_get(k_orient_ids[o]));
+        } break;
+        case MENU_BT_MODE: {
+            const char *io_name = "—";
+            BOOL_T io_unsupported = FALSE;
+            obd_session_io_status(&io_name, &io_unsupported);
+            uint8_t m = p ? p->bt_mode : (uint8_t)OBD_BT_MODE_BLE;
+            const char *want = (m == (uint8_t)OBD_BT_MODE_SPP) ? "SPP" : "BLE";
+            snprintf(buf, sizeof(buf), "%s%s%s",
+                     app_i18n_get(STR_MENU_BT_MODE),
+                     want,
+                     io_unsupported ? app_i18n_get(STR_BT_STUB_SUFFIX) : "");
+        } break;
+        case MENU_BT_PAIR: {
+            uint8_t m = p ? p->bt_mode : (uint8_t)OBD_BT_MODE_BLE;
+            snprintf(buf, sizeof(buf), "%s",
+                     app_i18n_get((m == (uint8_t)OBD_BT_MODE_SPP)
+                                       ? STR_MENU_BT_PAIR_SPP
+                                       : STR_MENU_BT_PAIR_BLE));
+        } break;
+        case MENU_LANG: {
+            /* Show the OTHER language's name in its own script so the
+             * action of tapping the row is obvious: tapping "中文"
+             * switches to Chinese, tapping "EN" switches to English.
+             * (More natural UX than showing the current language.) */
+            APP_LANG_E cur = app_i18n_lang();
+            const char *next_label = (cur == APP_LANG_EN)
+                ? "\xE8\xAF\xAD\xE8\xA8\x80\xEF\xBC\x9A\xE4\xB8\xAD\xE6\x96\x87"  /* 语言：中文 */
+                : "Language: EN";
+            snprintf(buf, sizeof(buf), "%s", next_label);
         } break;
         case MENU_FORGET:
-            snprintf(buf, sizeof(buf), "Forget Adapter : %s",
-                     (p && p->bound_addr_valid) ? "saved" : "(none)");
+            snprintf(buf, sizeof(buf), "%s%s",
+                     app_i18n_get(STR_MENU_FORGET),
+                     app_i18n_get((p && p->bound_addr_valid)
+                                       ? STR_MENU_FORGET_SAVED
+                                       : STR_MENU_FORGET_NONE));
             break;
-        case MENU_BACK:
-            snprintf(buf, sizeof(buf), "Back");
+        case MENU_CLOSE:
+            snprintf(buf, sizeof(buf), "%s", app_i18n_get(STR_MENU_CLOSE));
             break;
         default:
             buf[0] = '\0';
             break;
         }
-        lv_label_set_text(s_menu_items[i], buf);
-        lv_obj_set_style_text_color(s_menu_items[i],
-            (i == s_menu_cursor) ? UI_COLOR_PRIMARY : UI_COLOR_TEXT_DIM, 0);
+        lv_label_set_text(s_menu_labels[i], buf);
     }
 }
 
 /**
  * @brief Show / hide the menu.
+ *
+ * @param[in] show TRUE to show
+ * @return none
  */
 STATIC VOID_T __menu_show(BOOL_T show)
 {
@@ -475,7 +715,6 @@ STATIC VOID_T __menu_show(BOOL_T show)
         return;
     }
     if (show) {
-        s_menu_cursor = 0;
         __menu_redraw();
         lv_obj_clear_flag(s_menu_root, LV_OBJ_FLAG_HIDDEN);
         lv_obj_move_foreground(s_menu_root);
@@ -485,77 +724,22 @@ STATIC VOID_T __menu_show(BOOL_T show)
 }
 
 /* ---------------------------------------------------------------------------
- * Status bar
- * --------------------------------------------------------------------------- */
-/**
- * @brief Build a small status bar at the very top of the screen
- *        (BT icon + data source tag).
- */
-STATIC VOID_T __build_status_bar(VOID_T)
-{
-    s_status_bar = lv_obj_create(s_screen);
-    lv_obj_remove_style_all(s_status_bar);
-    lv_obj_set_size(s_status_bar, APP_LCD_WIDTH, 40);
-    lv_obj_align(s_status_bar, LV_ALIGN_TOP_MID, 0, 18);
-    lv_obj_clear_flag(s_status_bar, LV_OBJ_FLAG_SCROLLABLE);
-
-    s_lbl_bt = lv_label_create(s_status_bar);
-    lv_label_set_text(s_lbl_bt, LV_SYMBOL_BLUETOOTH " --");
-    lv_obj_set_style_text_color(s_lbl_bt, UI_COLOR_TEXT_DIM, 0);
-    lv_obj_set_style_text_font(s_lbl_bt, &lv_font_montserrat_16, 0);
-    lv_obj_align(s_lbl_bt, LV_ALIGN_LEFT_MID, 60, 0);
-
-    s_lbl_src = lv_label_create(s_status_bar);
-    lv_label_set_text(s_lbl_src, "—");
-    lv_obj_set_style_text_color(s_lbl_src, UI_COLOR_TEXT_DIM, 0);
-    lv_obj_set_style_text_font(s_lbl_src, &lv_font_montserrat_16, 0);
-    lv_obj_align(s_lbl_src, LV_ALIGN_RIGHT_MID, -60, 0);
-}
-
-/**
- * @brief Update the BT status text and source tag.
- */
-STATIC VOID_T __status_refresh(VOID_T)
-{
-    if (s_lbl_bt) {
-        const char *txt = LV_SYMBOL_BLUETOOTH " --";
-        switch (s_obd_state) {
-        case OBD_SES_OFF:       txt = LV_SYMBOL_BLUETOOTH " off";   break;
-        case OBD_SES_SCAN:      txt = LV_SYMBOL_BLUETOOTH " scan";  break;
-        case OBD_SES_LINKED:    txt = LV_SYMBOL_BLUETOOTH " init";  break;
-        case OBD_SES_READY:     txt = LV_SYMBOL_BLUETOOTH " ok";    break;
-        case OBD_SES_LINK_LOST: txt = LV_SYMBOL_BLUETOOTH " lost";  break;
-        }
-        lv_label_set_text(s_lbl_bt, txt);
-        lv_obj_set_style_text_color(s_lbl_bt,
-            (s_obd_state == OBD_SES_READY) ? UI_COLOR_OK : UI_COLOR_TEXT_DIM, 0);
-    }
-    if (s_lbl_src) {
-        APP_DATA_SRC_E src = app_metric_get_source();
-        const char *t = "—";
-        if (src == APP_DATA_SRC_OBD)  t = "OBD";
-        if (src == APP_DATA_SRC_MOCK) t = "MOCK";
-        if (src == APP_DATA_SRC_IMU)  t = "IMU";
-        lv_label_set_text(s_lbl_src, t);
-        lv_obj_set_style_text_color(s_lbl_src,
-            (src == APP_DATA_SRC_OBD) ? UI_COLOR_OK : UI_COLOR_ACCENT, 0);
-    }
-}
-
-/* ---------------------------------------------------------------------------
  * Refresh timer
  * --------------------------------------------------------------------------- */
 /**
  * @brief Periodic UI refresh (LVGL task context).
  *
- * 1. Update status bar
- * 2. Live-update the current gauge needle/value (with smooth slew)
- * 3. Auto-promote BOOT_SWEEP -> WAIT_LINK / MAIN
+ * 1. Live-update the current gauge needle/value (with smooth slew)
+ * 2. Auto-promote BOOT_SWEEP -> WAIT_LINK / MAIN
+ *
+ * The previous status bar (BT icon + MOCK tag at the top) was removed —
+ * those small white/yellow labels at the 11/1 o'clock dial corners
+ * looked like artefacts from a few feet away. BLE state is conveyed via
+ * the wait-link overlay; data source is conveyed via the menu.
  */
 STATIC VOID_T __refresh_timer_cb(lv_timer_t *t)
 {
     (void)t;
-    __status_refresh();
 
     APP_METRIC_BUS_T bus;
     BOOL_T have_bus = (app_metric_snapshot(&bus) == OPRT_OK);
@@ -585,20 +769,36 @@ STATIC VOID_T __refresh_timer_cb(lv_timer_t *t)
         return;
     }
 
-    /* Main: refresh the live gauge */
-    if (s_state == UI_STATE_MAIN && have_bus && s_gauge.root) {
+    /* Main: refresh the live widget. The G metric drives the GoPro target
+     * reticle directly with the (post-calibration) (gx, gy); every other
+     * metric goes through the dial gauge. */
+    if (s_state == UI_STATE_MAIN && have_bus) {
         const UI_GAUGE_DEF_T *d = &s_gauge_defs[s_curr_gauge_idx];
-        int32_t user_v = d->v_min;
-        char txt[16] = {0};
-        if (__metric_user_value(&bus, d, &user_v, txt, sizeof(txt))) {
-            ui_gauge_set_value_text(&s_gauge, txt);
-            uint32_t slew = s_first_value_after_link
-                                ? UI_NEEDLE_INTRO_MS
-                                : UI_NEEDLE_TRACK_MS;
-            ui_gauge_set_value(&s_gauge, user_v, slew);
-            s_first_value_after_link = FALSE;
-        } else {
-            ui_gauge_set_value_text(&s_gauge, "—");
+        if (d->metric == APP_METRIC_G_FORCE && s_gforce.root) {
+            if (bus.valid[APP_METRIC_G_FORCE]) {
+                /* Feed the GoPro reticle the orient-projected vehicle
+                 * axes (lat = right-of-driver, fwd = nose-of-car). The
+                 * IMU sampler does the projection per the user's
+                 * mounting selection, so the ball indicates car-frame
+                 * acceleration regardless of physical orientation. */
+                ui_gforce_set_xy(&s_gforce, bus.g_lat_mg, bus.g_fwd_mg);
+                s_first_value_after_link = FALSE;
+            }
+            ui_gforce_set_uncalibrated_hint(&s_gforce,
+                                            sensor_imu_calibration_active() ? FALSE : TRUE);
+        } else if (s_gauge.root) {
+            int32_t user_v = d->v_min;
+            char txt[16] = {0};
+            if (__metric_user_value(&bus, d, &user_v, txt, sizeof(txt))) {
+                ui_gauge_set_value_text(&s_gauge, txt);
+                uint32_t slew = s_first_value_after_link
+                                    ? UI_NEEDLE_INTRO_MS
+                                    : UI_NEEDLE_TRACK_MS;
+                ui_gauge_set_value(&s_gauge, user_v, slew);
+                s_first_value_after_link = FALSE;
+            } else {
+                ui_gauge_set_value_text(&s_gauge, "—");
+            }
         }
     }
 
@@ -642,12 +842,28 @@ OPERATE_RET ui_init(VOID_T)
         return rt;
     }
 
-    __build_status_bar();
+    rt = ui_gforce_create(&s_gforce, s_screen);
+    if (rt != OPRT_OK) {
+        ui_gauge_destroy(&s_gauge);
+        return rt;
+    }
+    /* Both widgets are full-screen siblings; we only ever show one of them
+     * at a time. The other is hidden so its layer doesn't waste blits. */
+    if (d->metric == APP_METRIC_G_FORCE) {
+        ui_gauge_set_visible(&s_gauge, FALSE);
+        ui_gforce_set_visible(&s_gforce, TRUE);
+    } else {
+        ui_gauge_set_visible(&s_gauge, TRUE);
+        ui_gforce_set_visible(&s_gforce, FALSE);
+    }
+
     __build_overlay();
     __build_menu();
 
-    /* Boot animation */
+    /* Boot animation: sweep both widgets so cycling to the hidden one
+     * later doesn't show an awkward "still at zero" first frame. */
     ui_gauge_sweep(&s_gauge, UI_BOOT_SWEEP_MS);
+    ui_gforce_sweep(&s_gforce, UI_BOOT_SWEEP_MS);
 
     s_state = UI_STATE_BOOT_SWEEP;
     s_boot_elapsed_ms = 0;
@@ -677,44 +893,39 @@ void ui_on_obd_state(OBD_SES_STATE_E st)
 }
 
 /**
- * @brief KEY handler — cycle gauges, or move cursor in MENU.
+ * @brief KEY handler — cycle to the next enabled gauge.
  *
- * Allowed in MAIN (animate to live value), WAIT_LINK (preview which
- * gauge will appear when OBD comes online), and MENU (cursor down).
- * Ignored during BOOT_SWEEP to keep the boot animation clean.
+ * Allowed in MAIN (animates to the live value) and WAIT_LINK (just
+ * reconfigures the dial title/range — no live value to animate to).
+ * Inert in MENU (menu is touchscreen-only) and BOOT_SWEEP (let the boot
+ * animation play out cleanly).
+ *
+ * @return none
  */
 void ui_show_next_gauge(VOID_T)
 {
-    if (s_state == UI_STATE_MENU) {
-        s_menu_cursor = (s_menu_cursor + 1) % MENU_COUNT;
-        __menu_redraw();
-        return;
-    }
     if (s_state != UI_STATE_MAIN && s_state != UI_STATE_WAIT_LINK) {
         return;
     }
     s_curr_gauge_idx = __next_enabled_gauge(s_curr_gauge_idx);
     app_kv_set_current_gauge((APP_METRIC_E)s_curr_gauge_idx);
-    /* In WAIT_LINK there's no live data yet, so don't try to animate-in:
-     * just reconfigure the dial so the user sees the new title/range
-     * once the overlay clears. */
     __apply_current_gauge(s_state == UI_STATE_MAIN);
 }
 
 /**
- * @brief Toggle the menu open/closed.
+ * @brief PWR short-press handler — toggle the menu open/closed.
  *
- * Reachable from any "live" state (MAIN or WAIT_LINK), so the user can
- * always get to Mock Mode / rescan even when the BLE link is stuck.
- * On close the right live state (MAIN or WAIT_LINK) is recomputed.
+ * Reachable from any "live" state (MAIN or WAIT_LINK) so the user can
+ * always reach Mock Mode / rescan, even with a stuck BLE link. Ignored
+ * during BOOT_SWEEP so the boot animation can play out. On close the
+ * right live state (MAIN or WAIT_LINK) is recomputed.
+ *
+ * @return none
  */
 void ui_toggle_menu(VOID_T)
 {
     if (s_state == UI_STATE_MENU) {
         __menu_show(FALSE);
-        /* Pick the right live state based on current OBD/mock; this also
-         * decides if the overlay should reappear and re-arms the smooth
-         * intro animation when we end up in MAIN. */
         __enter_live_state(__compute_live_state());
         return;
     }
@@ -725,47 +936,6 @@ void ui_toggle_menu(VOID_T)
     __overlay_show(FALSE);
     s_state = UI_STATE_MENU;
     __menu_show(TRUE);
-}
-
-/**
- * @brief PWR-short handler: in MENU activates the highlighted row.
- *        In MAIN/WAIT_LINK it's a no-op (PWR-long is the menu trigger).
- */
-void ui_handle_pwr_short(VOID_T)
-{
-    if (s_state != UI_STATE_MENU) {
-        return;
-    }
-    switch ((UI_MENU_E)s_menu_cursor) {
-    case MENU_MOCK: {
-        const APP_PREFS_T *p = app_kv_prefs();
-        BOOL_T en = (p && p->mock_enabled) ? FALSE : TRUE;
-        app_kv_set_mock_enabled(en);
-        ui_on_mock_changed(en);
-    } break;
-    case MENU_BRIGHT: {
-        const APP_PREFS_T *p = app_kv_prefs();
-        uint8_t b = p ? p->brightness_pct : 50;
-        b = (b >= 100) ? 20 : (b + 20);
-        app_kv_set_brightness(b);
-    } break;
-    case MENU_GAUGES: {
-        /* Cursor advance to next item; toggling individual gauges
-         * is done via the KEY button while highlighted. */
-        s_menu_cursor = (s_menu_cursor + 1) % MENU_COUNT;
-    } break;
-    case MENU_FORGET:
-        app_kv_clear_bound_addr();
-        obd_session_rescan();
-        break;
-    case MENU_BACK:
-        ui_toggle_menu();   /* close menu, restore live state */
-        return;
-    default:
-        break;
-    }
-    __menu_redraw();
-    obd_session_refresh_poll_list();
 }
 
 /**

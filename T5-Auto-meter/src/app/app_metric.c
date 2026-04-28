@@ -135,9 +135,11 @@ OPERATE_RET app_metric_set(APP_METRIC_E m, int32_t value)
 }
 
 /**
- * @brief Update G-force triplet (IMU writer).
+ * @brief Update raw IMU triplet + orient-projected forward/lateral pair.
  */
-OPERATE_RET app_metric_set_imu(int32_t gx_mg, int32_t gy_mg, int32_t gz_mg, int32_t roll_deg10)
+OPERATE_RET app_metric_set_imu(int32_t gx_mg, int32_t gy_mg, int32_t gz_mg,
+                               int32_t gfwd_mg, int32_t glat_mg,
+                               int32_t roll_deg10)
 {
     if (!s_inited) {
         return OPRT_NOT_FOUND;
@@ -146,6 +148,8 @@ OPERATE_RET app_metric_set_imu(int32_t gx_mg, int32_t gy_mg, int32_t gz_mg, int3
     s_bus.g_x_mg = gx_mg;
     s_bus.g_y_mg = gy_mg;
     s_bus.g_z_mg = gz_mg;
+    s_bus.g_fwd_mg = gfwd_mg;
+    s_bus.g_lat_mg = glat_mg;
     s_bus.roll_deg10 = roll_deg10;
     s_bus.valid[APP_METRIC_G_FORCE] = TRUE;
     s_bus.last_update_ms[APP_METRIC_G_FORCE] = tal_system_get_millisecond();

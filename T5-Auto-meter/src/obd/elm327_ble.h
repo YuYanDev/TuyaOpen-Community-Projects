@@ -1,13 +1,22 @@
 /**
  * @file elm327_ble.h
- * @brief Minimal BLE central transport for ELM327 OBD-II adapters.
- * @version 1.0
- * @date 2026-04-27
+ * @brief BLE 4.0 GATT central transport for ELM327 OBD-II adapters.
+ * @version 1.1
+ * @date 2026-04-28
  * @copyright Copyright (c) Tuya Inc.
  *
- * @note Only BLE 4.0 (HM-10/JDY-08 style 0xFFE0/0xFFE1, OBDLink/Vgate
- *       0xFFF0/0xFFF1+0xFFF2 style) is supported. Classic Bluetooth SPP is
- *       NOT supported.
+ * @note v1.8 — this file now exposes BOTH the legacy direct API (kept
+ *       so existing callers continue to compile) AND the unified
+ *       OBD_IO_T vtable instance via obd_io_ble(). New callers should
+ *       only consume the vtable; the direct functions are retained
+ *       to keep the migration patch small.
+ *
+ * Adapters covered:
+ *   - HM-10 / JDY-08 style (0xFFE0 / 0xFFE1 single-pipe characteristic)
+ *   - OBDLink LX BT / Vgate iCar Pro BLE (0xFFF0 / 0xFFF1+0xFFF2 split)
+ *
+ * Bluetooth Classic SPP (the original ELM327 v1.5 25K80 dongles) is
+ * NOT served by this file — see elm327_spp.c (v1.8 stub).
  */
 #ifndef __ELM327_BLE_H__
 #define __ELM327_BLE_H__
@@ -17,28 +26,7 @@ extern "C" {
 #endif
 
 #include "tuya_cloud_types.h"
-
-/* ---------------------------------------------------------------------------
- * Type definitions
- * --------------------------------------------------------------------------- */
-typedef enum {
-    ELM_BLE_EV_SCAN_STARTED = 0,
-    ELM_BLE_EV_SCAN_TIMEOUT,
-    ELM_BLE_EV_DEVICE_FOUND,
-    ELM_BLE_EV_CONNECTING,
-    ELM_BLE_EV_CONNECTED,        /**< writeable & subscribed pipe ready */
-    ELM_BLE_EV_DISCONNECTED,
-    ELM_BLE_EV_RX_LINE           /**< complete '>' or '\r' terminated line */
-} ELM_BLE_EVENT_E;
-
-typedef struct {
-    ELM_BLE_EVENT_E type;
-    uint8_t  peer_addr[6];
-    char    *line;               /**< only valid for ELM_BLE_EV_RX_LINE */
-    int      rssi;
-} ELM_BLE_EVENT_T;
-
-typedef void (*ELM_BLE_CB)(const ELM_BLE_EVENT_T *evt);
+#include "obd_io.h"
 
 /* ---------------------------------------------------------------------------
  * Function declarations
@@ -49,7 +37,7 @@ typedef void (*ELM_BLE_CB)(const ELM_BLE_EVENT_T *evt);
  *               work brief, push longer work onto your own thread)
  * @return OPRT_OK on success
  */
-OPERATE_RET elm327_ble_init(ELM_BLE_CB cb);
+OPERATE_RET elm327_ble_init(OBD_IO_CB cb);
 
 /**
  * @brief Start scanning for ELM327 BLE adapters.

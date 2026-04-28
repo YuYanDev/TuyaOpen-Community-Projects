@@ -61,6 +61,23 @@ OPERATE_RET obd_session_refresh_poll_list(VOID_T);
  */
 OBD_SES_STATE_E obd_session_state(VOID_T);
 
+/**
+ * @brief Snapshot of the active transport backend.
+ *
+ * The UI overlay calls this to render a backend tag (e.g. "BLE" or
+ * "SPP") and the WAIT_LINK hint when SPP is selected but the v1.8
+ * stub has reported NOT_SUPPORTED.
+ *
+ * @param[out] out_name optional pointer that receives the static
+ *                      backend name string ("BLE" / "SPP" / "—").
+ *                      Lifetime is process-lifetime, do not free.
+ * @param[out] out_unsupported optional pointer set to TRUE if the
+ *                      backend init returned OPRT_NOT_SUPPORTED
+ *                      (e.g. SPP on v1.8). Set to FALSE otherwise.
+ * @return none
+ */
+void obd_session_io_status(const char **out_name, BOOL_T *out_unsupported);
+
 #ifdef __cplusplus
 }
 #endif

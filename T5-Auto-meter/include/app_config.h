@@ -50,7 +50,7 @@ extern "C" {
 
 /* Boot animation timing (ms) */
 #define APP_BOOT_LOGO_FADE_MS       400
-#define APP_BOOT_SWEEP_MS           1100
+#define APP_BOOT_SWEEP_MS           1320
 #define APP_BOOT_HOLD_MS            300
 #define APP_BOOT_BLE_HINT_MS        500
 

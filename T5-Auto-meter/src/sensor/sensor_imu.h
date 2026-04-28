@@ -25,6 +25,32 @@ extern "C" {
  */
 OPERATE_RET sensor_imu_start(VOID_T);
 
+/**
+ * @brief Capture the device's CURRENT static gravity vector and persist it
+ *        as the G-force zero calibration. Subsequent IMU samples have
+ *        the offsets subtracted before being pushed to the metric bus, so
+ *        the GoPro target reticle reads (0, 0) when the user is at rest
+ *        — irrespective of mounting orientation (vertical, slanted,
+ *        rotated 90°).
+ *
+ * @return OPRT_OK on success, OPRT_COM_ERROR if no IMU sample is available.
+ * @note Safe to call from any task. The actual capture happens on the next
+ *       IMU sample tick (≤ 20 ms) and persistence is performed on the IMU
+ *       task to avoid cross-task state corruption.
+ */
+OPERATE_RET sensor_imu_calibrate_zero(VOID_T);
+
+/**
+ * @brief Discard the user-supplied G zero calibration.
+ * @return OPRT_OK on success
+ */
+OPERATE_RET sensor_imu_clear_calibration(VOID_T);
+
+/**
+ * @brief Whether a user-supplied G calibration is currently active.
+ */
+BOOL_T sensor_imu_calibration_active(VOID_T);
+
 #ifdef __cplusplus
 }
 #endif

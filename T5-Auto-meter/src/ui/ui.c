@@ -218,7 +218,11 @@ STATIC BOOL_T __metric_user_value(const APP_METRIC_BUS_T *bus,
 {
     if (bus == NULL || def == NULL || !bus->valid[def->metric]) {
         if (out_text && cap) {
-            snprintf(out_text, cap, "—");
+            /* ASCII "--" rather than U+2014 — the live readout uses
+             * lv_font_montserrat_48 (ASCII-only) so an em-dash would
+             * render as a tofu box. Same for the other two fall-back
+             * sites in this file. */
+            snprintf(out_text, cap, "--");
         }
         return FALSE;
     }
@@ -330,7 +334,7 @@ STATIC VOID_T __apply_current_gauge(BOOL_T animate_in)
         ui_gauge_set_value_text(&s_gauge, txt);
         ui_gauge_set_value(&s_gauge, user_v, UI_NEEDLE_INTRO_MS);
     } else {
-        ui_gauge_set_value_text(&s_gauge, "—");
+        ui_gauge_set_value_text(&s_gauge, "--");
     }
 }
 
@@ -819,7 +823,7 @@ STATIC VOID_T __refresh_timer_cb(lv_timer_t *t)
                 ui_gauge_set_value(&s_gauge, user_v, slew);
                 s_first_value_after_link = FALSE;
             } else {
-                ui_gauge_set_value_text(&s_gauge, "—");
+                ui_gauge_set_value_text(&s_gauge, "--");
             }
         }
     }

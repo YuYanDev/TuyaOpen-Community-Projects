@@ -168,6 +168,33 @@ typedef struct {
     lv_area_t   prev_dirty[4];
     uint8_t     prev_dirty_idx;   /**< 0..3; next slot to overwrite */
 
+    /* Boot-sweep MIN-pose anchor.
+     * --------------------------
+     * Problem: dual-buffer alternation drift can orphan the dial-MIN
+     * pose's needle silhouette on whichever framebuffer skipped a
+     * paint cycle (the user-reported "WATER TEMP 40 下面的区块有
+     * 指针残留"). The 4-deep prev_dirty ring covers it for the first
+     * ~40 ms but if alternation slips badly, MIN pixels can survive.
+     *
+     * Solution: every sweep frame, ALSO invalidate a cached MIN-pose
+     * AABB so it gets repainted on whichever buffer LVGL renders
+     * next. Cost: ~6 kpx fill per frame, same order as one ring slot.
+     *
+     * The cache is computed in ui_gauge_sweep() AFTER an explicit
+     * lv_obj_update_layout() call — LVGL v9 defers layout to the
+     * refresh phase, so reading needle obj coords before that returns
+     * stale (≈0) values, and a lazy-build inside an anim callback
+     * doesn't help (the anim cb still runs BEFORE refresh in the same
+     * lv_timer_handler() pass). Force-layout is the only reliable
+     * way to get correct cx/cy at sweep_start.
+     *
+     *   sweep_anchor_armed  : TRUE between ui_gauge_sweep() start and
+     *                         __sweep_ready_cb() / ui_gauge_set_def()
+     *                         abort. Steady-state tracker keeps it
+     *                         FALSE so the per-frame cost is zero. */
+    lv_area_t   sweep_anchor_dirty;
+    BOOL_T      sweep_anchor_armed;
+
     lv_timer_t *track_timer;      /**< 200 Hz tracker that glides angle to target */
     lv_anim_t   anim;             /**< only used for the boot sweep */
     BOOL_T      sweep_running;    /**< pause tracker while the sweep animation runs */

@@ -397,6 +397,24 @@ STATIC VOID_T __needle_invalidate_swept(UI_GAUGE_T *g)
     }
     lv_obj_invalidate_area(g->root, &new_area);
 
+    /* Boot-sweep only: scrub the MIN pose every frame so dual-buffer
+     * alternation drift can't leave the starting needle silhouette
+     * dangling (user-reported "WATER TEMP 40 下面的区块有指针残留").
+     *
+     * The cache is built ONCE at sweep_start (in ui_gauge_sweep,
+     * AFTER lv_obj_update_layout forces the needle obj's coords to
+     * resolve), so this fast-path is just one cheap invalidate per
+     * frame — same order of magnitude as one ring slot.
+     *
+     * We deliberately do NOT also scrub MAX: in practice only the
+     * MIN end shows the residue, and adding a second far-apart small
+     * AABB doubles the SW renderer's region dispatch cost during the
+     * wide-span middle frames where MIN and the live AABB sit on
+     * opposite sides of the dial. */
+    if (g->sweep_anchor_armed) {
+        lv_obj_invalidate_area(g->root, &g->sweep_anchor_dirty);
+    }
+
     /* Ring-buffer write: overwrite the oldest slot, advance idx mod RING. */
     g->prev_dirty[g->prev_dirty_idx] = new_area;
     g->prev_dirty_idx = (uint8_t)((g->prev_dirty_idx + 1) % GAUGE_DIRTY_RING);
@@ -516,6 +534,10 @@ STATIC VOID_T __sweep_ready_cb(lv_anim_t *a)
     }
     g->sweep_running = FALSE;
     g->needle_target_x10 = g->needle_angle_x10;  /* lock target to MIN */
+    /* Drop the per-frame MIN anchor — steady-state tracker doesn't
+     * need it (the 4-deep ring is sufficient at the gentle angular
+     * velocities the EMA tracker produces). */
+    g->sweep_anchor_armed = FALSE;
 
     /* v1.8 — force a CLEAN repaint of the whole needle area when the
      * sweep completes. The animation's final tick used a per-frame AABB
@@ -869,9 +891,14 @@ OPERATE_RET ui_gauge_create(UI_GAUGE_T *g, lv_obj_t *parent,
     lv_obj_set_style_text_font(g->label_title, &lv_font_montserrat_28, 0);
     lv_obj_align(g->label_title, LV_ALIGN_BOTTOM_MID, 0, -150);
 
-    /* Live readout — moved DOWN by 47 px (≈ 10 % of 466 px panel). */
+    /* Live readout — moved DOWN by 47 px (≈ 10 % of 466 px panel).
+     *
+     * Placeholder uses ASCII "--" (two hyphens) rather than U+2014
+     * EM-DASH because `lv_font_montserrat_48` ships with only the
+     * 0x20..0x7F range and would render U+2014 as a tofu box during
+     * the boot sweep — the user's "自检的时候，值是个方块" report. */
     g->label_value = lv_label_create(g->root);
-    lv_label_set_text(g->label_value, "—");
+    lv_label_set_text(g->label_value, "--");
     lv_obj_set_style_text_color(g->label_value, UI_COLOR_TEXT, 0);
     lv_obj_set_style_text_font(g->label_value, &lv_font_montserrat_48, 0);
     lv_obj_align(g->label_value, LV_ALIGN_BOTTOM_MID, 0, -83);
@@ -911,6 +938,7 @@ OPERATE_RET ui_gauge_set_def(UI_GAUGE_T *g,
     /* Cancel any in-flight sweep before changing the range. */
     lv_anim_delete(g, __sweep_anim_cb);
     g->sweep_running = FALSE;
+    g->sweep_anchor_armed = FALSE;  /* drop the MIN anchor (sweep aborted) */
 
     g->val_min = val_min;
     g->val_max = val_max;
@@ -937,7 +965,7 @@ OPERATE_RET ui_gauge_set_def(UI_GAUGE_T *g,
         lv_label_set_text(g->label_unit, unit);
     }
     if (g->label_value) {
-        lv_label_set_text(g->label_value, "—");
+        lv_label_set_text(g->label_value, "--");
     }
     /* Full redraw + sync the dirty-area ring so the first tracker tick
      * after a gauge swap doesn't accidentally invalidate a stale area. */
@@ -1039,11 +1067,31 @@ void ui_gauge_sweep(UI_GAUGE_T *g, uint32_t duration_ms)
      * We also seed all 4 ring slots with the MIN AABB so the first
      * tick's __needle_invalidate_swept() can build its swept-band
      * union with no "phantom" empty rectangles in the trail. */
+    /* Force-resolve LVGL's deferred layout for the gauge subtree BEFORE
+     * we read needle obj coords. LVGL v9 only computes obj->coords
+     * during the refresh phase of lv_timer_handler() — anim/timer
+     * callbacks (which is where __needle_invalidate_swept reads
+     * coords) run BEFORE that, so without this forced update, both a
+     * sweep_start cache AND a first-frame lazy build would land on
+     * stale (≈0) coords and the resulting AABB would scrub the wrong
+     * pixels. lv_obj_update_layout walks the subtree synchronously
+     * and writes final coords, making lv_obj_get_coords reliable
+     * from this line onwards. */
+    lv_obj_update_layout(g->root);
+
     lv_obj_invalidate(g->needle);
     {
         lv_area_t initial;
         __needle_compute_aabb(g, g->needle_angle_x10, &initial);
         __needle_dirty_ring_seed(g, &initial);
+
+        /* Cache the MIN-pose AABB once. Layout is now resolved
+         * (lv_obj_update_layout above), so coords are reliable.
+         * __needle_invalidate_swept replays this cache on every
+         * sweep frame. Cleared in __sweep_ready_cb (natural finish)
+         * or ui_gauge_set_def() (KEY-cycle abort). */
+        g->sweep_anchor_dirty = initial;
+        g->sweep_anchor_armed = TRUE;
     }
 
     lv_anim_init(&g->anim);
@@ -1069,7 +1117,7 @@ void ui_gauge_set_value_text(UI_GAUGE_T *g, const char *text)
     if (g == NULL || g->label_value == NULL) {
         return;
     }
-    lv_label_set_text(g->label_value, (text && *text) ? text : "—");
+    lv_label_set_text(g->label_value, (text && *text) ? text : "--");
 }
 
 /**

@@ -189,15 +189,23 @@ typedef struct {
      * way to get correct cx/cy at sweep_start.
      *
      *   sweep_anchor_armed  : TRUE between ui_gauge_sweep() start and
-     *                         __sweep_ready_cb() / ui_gauge_set_def()
-     *                         abort. Steady-state tracker keeps it
-     *                         FALSE so the per-frame cost is zero. */
+     *                         __sweep_finish() (natural finish path
+     *                         from __sweep_timer_cb, OR KEY-cycle
+     *                         abort path from ui_gauge_set_def).
+     *                         Steady-state tracker keeps it FALSE so
+     *                         the per-frame cost is zero. */
     lv_area_t   sweep_anchor_dirty;
     BOOL_T      sweep_anchor_armed;
 
     lv_timer_t *track_timer;      /**< 200 Hz tracker that glides angle to target */
-    lv_anim_t   anim;             /**< only used for the boot sweep */
-    BOOL_T      sweep_running;    /**< pause tracker while the sweep animation runs */
+    lv_timer_t *sweep_timer;      /**< 200 Hz boot-sweep driver (replaces lv_anim
+                                       so sweep walks the same low-jerk dirty path
+                                       as the steady-state tracker — see file
+                                       header §"Boot sweep"). NULL outside the
+                                       sweep window. */
+    uint32_t    sweep_start_ms;   /**< lv_tick_get() at sweep launch */
+    uint32_t    sweep_total_ms;   /**< full MIN→MAX→MIN duration */
+    BOOL_T      sweep_running;    /**< pause tracker while the sweep timer runs */
     BOOL_T      needle_visible;   /**< drawer-level paint gate. FALSE between
                                        create() and the first ui_gauge_sweep();
                                        TRUE thereafter. The needle obj's HIDDEN

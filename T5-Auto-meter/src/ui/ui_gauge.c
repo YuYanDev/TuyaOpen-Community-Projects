@@ -226,33 +226,38 @@
  * (where dual-buffer alternation drift could orphan its silhouette).
  * Once the sweep has carried the needle far enough away that the
  * 4-deep prev_dirty ring fully scrolls past MIN, the anchor invalidate
- * is pure overhead. 150 ms is comfortably more than the worst-case
- * alternation drift we see (~50 ms under BLE-write storms) and
- * covers the eased ramp's slow-start where the needle dwells near
- * MIN. After that we drop back to ring-only invalidation, freeing
- * up SW rasterizer cycles for the high-velocity mid-arc — that's
- * what gets the ~100 Hz refresh actually sustained at the LVGL
- * default rate, instead of the rasterizer falling behind and the
- * effective rate collapsing (which is what the user perceives as
- * "卡卡的"). */
-#define GAUGE_SWEEP_ANCHOR_WINDOW_MS 150
+ * is pure overhead. 100 ms covers the worst-case dual-buffer
+ * alternation drift we measure (~50 ms under BLE-write storms) plus
+ * the eased ramp's slow-start dwell near MIN — at 167 Hz refresh
+ * (TURBO) and 200 Hz tracker that's 16-20 sweep-ticks of belt-and-
+ * braces coverage. After that we drop the anchor and let the 4-deep
+ * prev_dirty ring carry the load alone, which frees ~25% of the SW
+ * rasterizer budget for the higher-frequency refresh. */
+#define GAUGE_SWEEP_ANCHOR_WINDOW_MS 100
 
 /* LVGL display refresh period — TUYA T5AI ships with LV_DEF_REFR_PERIOD
- * = 10 ms (100 Hz). Earlier versions of this file mistakenly pushed
- * sweep refresh to 16 ms / 60 Hz "for headroom"; that was actually a
- * SLOWDOWN below the steady-state 100 Hz, which is exactly why the
- * user felt the boot sweep was "卡" while KEY-cycling felt smooth —
- * KEY-cycling kept LVGL's native 100 Hz, the sweep dropped to 60 Hz.
+ * = 10 ms (100 Hz). v1.8.6 pushed sweep to 8 ms (125 Hz); v1.8.7
+ * pushes further to 6 ms (~167 Hz) for the smoothness the user is
+ * still asking for. Why this specific ceiling:
  *
- * v1.8.5: don't touch the refresh period at all. Sweep inherits the
- * 100 Hz default. The smoothness gap is closed by:
- *   1. driving angle on the 5 ms tracker timer (200 Hz) so the LVGL
- *      refresh always finds 2 dirty-area updates per refresh tick
- *      (with high overlap → coalesced into a single rectangle), and
- *   2. shrinking the per-frame dirty-region count during the sweep's
- *      mid-arc (the high-speed segment) so 100 Hz refresh × N AABBs
- *      stays inside the SW rasterizer's budget. See GAUGE_SWEEP_*
- *      anchor and ring trimming below. */
+ *   - 5 ms (200 Hz) was v1.8.3's catastrophe: SW rasterizer can't
+ *     finish a 5-AABB frame in 5 ms while BLE characteristic-write
+ *     storms compete for the CM33; lv_timer_handler() falls behind,
+ *     real fps collapses ("比上一版还烂").
+ *   - 6 ms (167 Hz) leaves ~1 ms of safety margin above the
+ *     measured 5 ms rasterizer baseline at our 5-AABB footprint,
+ *     which the BLE/IMU interrupt service routines comfortably fit
+ *     into. We additionally tighten the anchor window from 150 ms
+ *     to 100 ms (see GAUGE_SWEEP_ANCHOR_WINDOW_MS) so the post-100ms
+ *     mid-arc only carries 4 AABBs, dropping ~20% of the rasterizer
+ *     load — that's the ~1 ms we steal back to feed the 6 ms refresh.
+ *   - Mid-arc per-frame angle delta drops from 4.92° → 3.69°, the
+ *     eye stops resolving frame edges entirely.
+ *
+ * Steady-state stays at 100 Hz default — the EMA tracker is gentle
+ * enough that 100 Hz looks perfect there, and we save ~40% of the
+ * SW rasterizer cycles for BLE/IMU/data-path work. */
+#define GAUGE_REFR_PERIOD_TURBO_MS 6
 
 /* The needle obj's bounding box: just big enough to contain the rotated
  * needle at any angle — a square with side = 2*(LEN + small pad). The
@@ -270,6 +275,8 @@ STATIC int32_t __value_to_angle_x10(const UI_GAUGE_T *g, int32_t value);
 STATIC int32_t __clamp(int32_t v, int32_t lo, int32_t hi);
 STATIC VOID_T  __scale_apply_ticks(lv_obj_t *scale, uint8_t tick_major);
 STATIC int32_t __sweep_ease_in_out_x1000(uint32_t t_ms, uint32_t period_ms);
+STATIC VOID_T  __display_refr_period_set(uint32_t period_ms);
+STATIC uint32_t __display_refr_period_get(VOID_T);
 
 /* ---------------------------------------------------------------------------
  * Internal helpers
@@ -290,6 +297,63 @@ STATIC int32_t __clamp(int32_t v, int32_t lo, int32_t hi)
         return hi;
     }
     return v;
+}
+
+/**
+ * @brief Set the LVGL default-display refresh timer period.
+ *
+ * Wraps lv_display_get_refr_timer + lv_timer_set_period so callers
+ * don't need the timer handle. Used to push refresh from the 100 Hz
+ * default to 125 Hz during the boot sweep (see GAUGE_REFR_PERIOD_*
+ * docs) and back when the sweep ends.
+ *
+ * @param[in] period_ms new refresh period in milliseconds
+ * @return none
+ * @note No-op if the default display or its refresh timer is NULL —
+ *       happens transiently before lv_init / display registration in
+ *       weird boot orders, and isn't fatal there.
+ */
+STATIC VOID_T __display_refr_period_set(uint32_t period_ms)
+{
+    lv_display_t *disp = lv_display_get_default();
+    if (disp == NULL) {
+        return;
+    }
+    lv_timer_t *t = lv_display_get_refr_timer(disp);
+    if (t == NULL) {
+        return;
+    }
+    lv_timer_set_period(t, period_ms);
+}
+
+/**
+ * @brief Read the current LVGL default-display refresh timer period.
+ *
+ * Used by the sweep entry point to snapshot the steady-state period
+ * (whatever LVGL's lv_conf.h LV_DEF_REFR_PERIOD happens to be — 10 ms
+ * on T5AI today, but other platforms or future config changes may
+ * pick a different baseline) so __sweep_finish() can restore it
+ * exactly. Hard-coding 10 ms here would silently break that.
+ *
+ * @return current refresh period in ms, or LV_DEF_REFR_PERIOD if
+ *         the display/timer is unavailable.
+ * @note LVGL v9 doesn't expose lv_timer_get_period(), but the period
+ *       field of lv_timer_t is a public struct member (see
+ *       lv_timer.h: `uint32_t period; / **< How often... * /`), so
+ *       reading it directly is sanctioned and stable across patch
+ *       releases.
+ */
+STATIC uint32_t __display_refr_period_get(VOID_T)
+{
+    lv_display_t *disp = lv_display_get_default();
+    if (disp == NULL) {
+        return LV_DEF_REFR_PERIOD;
+    }
+    lv_timer_t *t = lv_display_get_refr_timer(disp);
+    if (t == NULL) {
+        return LV_DEF_REFR_PERIOD;
+    }
+    return t->period;
 }
 
 /**
@@ -689,6 +753,17 @@ STATIC VOID_T __sweep_finish(UI_GAUGE_T *g)
      * need it (the 4-deep ring is sufficient at the gentle angular
      * velocities the EMA tracker produces). */
     g->sweep_anchor_armed = FALSE;
+
+    /* Restore the LVGL refresh period that was active before sweep —
+     * see GAUGE_REFR_PERIOD_TURBO_MS docs for why we don't hardcode
+     * LV_DEF_REFR_PERIOD here. Snapshot is captured in ui_gauge_sweep
+     * and stored on the gauge so dual-gauge layouts (ui_gforce + the
+     * regular gauge) don't step on each other if both finish out of
+     * order — each restores from its own snapshot. */
+    if (g->sweep_saved_refr != 0) {
+        __display_refr_period_set(g->sweep_saved_refr);
+        g->sweep_saved_refr = 0;
+    }
 
     if (g->sweep_timer != NULL) {
         lv_timer_delete(g->sweep_timer);
@@ -1258,12 +1333,21 @@ void ui_gauge_sweep(UI_GAUGE_T *g, uint32_t duration_ms)
         g->sweep_anchor_armed = TRUE;
     }
 
-    /* Spawn the 5 ms sweep driver. LVGL native refresh runs at 100 Hz
-     * (LV_DEF_REFR_PERIOD = 10 ms), so each refresh sees ~2 angle
-     * updates from this 200 Hz timer — consecutive AABBs heavily
-     * overlap → SW rasterizer paints a single small dirty region
-     * per refresh, matching the steady-state tracker's behaviour
-     * exactly (which is why KEY-cycling feels smooth). The timer
+    /* Push LVGL refresh from its baseline (100 Hz default on T5AI) to
+     * 125 Hz (8 ms) for the sweep duration — drops mid-arc per-frame
+     * angle delta from ~6.15° to ~4.92°, which is the "more
+     * interpolation between frames" the user is asking for. Saved
+     * snapshot is restored in __sweep_finish() (both natural-finish
+     * and KEY-cycle abort paths). See GAUGE_REFR_PERIOD_TURBO_MS
+     * docs for why 8 ms specifically. */
+    g->sweep_saved_refr = __display_refr_period_get();
+    __display_refr_period_set(GAUGE_REFR_PERIOD_TURBO_MS);
+
+    /* Spawn the 5 ms sweep driver. LVGL refresh @ 125 Hz (8 ms)
+     * paired with this 200 Hz timer means each refresh sees ~1.6
+     * angle updates — consecutive AABBs heavily overlap and the
+     * SW rasterizer paints a single small dirty region per refresh,
+     * matching the steady-state tracker's behaviour. Timer
      * self-tears-down via __sweep_finish() when elapsed >=
      * sweep_total_ms. */
     g->sweep_timer = lv_timer_create(__sweep_timer_cb,

@@ -205,6 +205,9 @@ typedef struct {
                                        sweep window. */
     uint32_t    sweep_start_ms;   /**< lv_tick_get() at sweep launch */
     uint32_t    sweep_total_ms;   /**< full MIN→MAX→MIN duration */
+    uint32_t    sweep_saved_refr; /**< LVGL refresh period (ms) before
+                                       sweep pushed it to TURBO; restored
+                                       in __sweep_finish */
     BOOL_T      sweep_running;    /**< pause tracker while the sweep timer runs */
     BOOL_T      needle_visible;   /**< drawer-level paint gate. FALSE between
                                        create() and the first ui_gauge_sweep();
